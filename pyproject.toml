@@ -1,0 +1,14 @@
+[project]
+name = "bnf-wrf-eval"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+bnf-wrf-eval = "bnf_wrf_eval:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"
