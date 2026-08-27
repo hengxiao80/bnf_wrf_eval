@@ -4,7 +4,17 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "boto3>=1.34",
+    "cartopy>=0.25.0",
+    "cfgrib>=0.9.15.1",
+    "eccodes>=2.48.0",
+    "ecmwflibs>=0.7.0",
+    "matplotlib>=3.11.1",
+    "netcdf4>=1.7.4",
+    "wrf-python>=1.3.4",
+    "xarray>=2026.7.0",
+]
 
 [project.scripts]
 bnf-wrf-eval = "bnf_wrf_eval:main"
@@ -12,3 +22,32 @@ bnf-wrf-eval = "bnf_wrf_eval:main"
 [build-system]
 requires = ["uv_build>=0.12.6,<0.13.0"]
 build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
+    "nbconvert>=7.17.1",
+]
+
+[tool.uv.extra-build-dependencies]
+# wrf-python's setup.py imports numpy directly (it builds compiled
+# Fortran/C extensions) but doesn't declare numpy as a build-system
+# requirement, so uv's isolated build environment doesn't have it unless
+# told to add it here.
+wrf-python = ["numpy"]
+
+[[tool.uv.dependency-metadata]]
+# wrf-python unconditionally declares a dependency on basemap (no extras
+# mechanism to opt out), and every basemap release caps numpy/matplotlib to
+# versions well below what this project already needs
+# (matplotlib>=3.11.1). basemap is legacy/superseded by cartopy anyway, and
+# we only use wrf-python's numerical `getvar(..., "ctt")` diagnostic, none
+# of its basemap-based plotting helpers -- so it's safe to skip installing
+# it. This replaces wrf-python's own declared dependency metadata (uv's
+# documented mechanism for "this package declares a dependency I don't
+# want") with the same list minus basemap.
+name = "wrf-python"
+version = "1.3.4.1"
+# setuptools pinned <81: wrf-python imports pkg_resources at module import
+# time, which recent setuptools releases have dropped.
+requires-dist = ["numpy>=1.11", "setuptools<81", "wrapt", "xarray"]

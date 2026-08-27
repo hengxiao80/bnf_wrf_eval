@@ -1,0 +1,520 @@
+"""Side-by-side WRF vs. HRRR vs. observations comparison plots."""
+
+from __future__ import annotations
+
+import datetime as dt
+from pathlib import Path
+
+import cartopy.crs as ccrs
+import cartopy.feature as cfeature
+import matplotlib.pyplot as plt
+import numpy as np
+
+from . import goes as goes_reader
+from . import hrrr as hrrr_reader
+from . import mrms as mrms_reader
+from . import wrf as wrf_reader
+
+DEFAULT_REFL_LEVELS = np.arange(5, 76, 5)
+DEFAULT_CTT_LEVELS = np.arange(190, 315, 5)
+
+# DOE ARM Bankhead National Forest (BNF) site.
+BNF_SITE_LAT = 34.342481
+BNF_SITE_LON = -87.338177
+
+
+def _domain_extent(lon: np.ndarray, lat: np.ndarray, pad_deg: float) -> tuple[float, float, float, float]:
+    return (
+        float(np.nanmin(lon)) - pad_deg,
+        float(np.nanmax(lon)) + pad_deg,
+        float(np.nanmin(lat)) - pad_deg,
+        float(np.nanmax(lat)) + pad_deg,
+    )
+
+
+def _crop_to_extent(
+    lon: np.ndarray, lat: np.ndarray, values: np.ndarray, extent: tuple[float, float, float, float], pad_cells: int = 30
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Slice a curvilinear grid down to the rows/cols overlapping `extent`.
+
+    Keeps pcolormesh fast and avoids projecting the full (e.g. CONUS-wide
+    HRRR) grid when only a small sub-domain is actually shown.
+
+    `pad_cells` needs to be generous (not just 1-2 cells): pcolormesh
+    mis-renders the outermost row/col of a rotated curvilinear mesh (shows
+    as a spurious blank diagonal wedge) when that edge sits close to the
+    visible map extent, so the crop must extend well past what's actually
+    shown to push that artifact outside the visible area.
+    """
+    lon_min, lon_max, lat_min, lat_max = extent
+    mask = (lon >= lon_min) & (lon <= lon_max) & (lat >= lat_min) & (lat <= lat_max)
+    if not mask.any():
+        return lon, lat, values
+    rows = np.where(mask.any(axis=1))[0]
+    cols = np.where(mask.any(axis=0))[0]
+    r0, r1 = max(rows.min() - pad_cells, 0), min(rows.max() + pad_cells + 1, lon.shape[0])
+    c0, c1 = max(cols.min() - pad_cells, 0), min(cols.max() + pad_cells + 1, lon.shape[1])
+    sl = (slice(r0, r1), slice(c0, c1))
+    return lon[sl], lat[sl], values[sl]
+
+
+def _domain_outline(lon: np.ndarray, lat: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Trace the outer edge of a 2D curvilinear grid as one closed loop
+    (its four sides, corner to corner), for drawing a domain boundary
+    line."""
+    lon_b = np.concatenate([lon[0, :], lon[:, -1], lon[-1, ::-1], lon[::-1, 0]])
+    lat_b = np.concatenate([lat[0, :], lat[:, -1], lat[-1, ::-1], lat[::-1, 0]])
+    return lon_b, lat_b
+
+
+def _find_wrf_file(run_dir: Path, domain: str, time: dt.datetime) -> Path:
+    wrf_file = run_dir / f"wrfout_{domain}_{time:%Y-%m-%d_%H_%M_%S}"
+    if not wrf_file.exists():
+        raise FileNotFoundError(f"No wrfout file for {time} at {wrf_file}")
+    return wrf_file
+
+
+def _find_hrrr_file(hrrr_base_dir: str | Path, time: dt.datetime) -> Path:
+    hrrr_file = Path(hrrr_base_dir) / f"{time:%Y%m%d}" / f"hrrr.t{time:%H}z.wrfnatf00.grib2"
+    if not hrrr_file.exists():
+        raise FileNotFoundError(f"No HRRR native-level analysis file for {time} at {hrrr_file}")
+    return hrrr_file
+
+
+def _output_path(output_base_dir: str | Path, prefix: str, run_dir: Path, time: dt.datetime) -> Path:
+    output_base_dir = Path(output_base_dir)
+    output_base_dir.mkdir(parents=True, exist_ok=True)
+    run_label = f"{run_dir.parent.name}_{run_dir.name}"
+    return output_base_dir / f"{prefix}_{run_label}_{time:%Y%m%d_%H%MZ}.png"
+
+
+def _plot_panel(
+    ax,
+    lon: np.ndarray,
+    lat: np.ndarray,
+    values: np.ndarray,
+    levels: np.ndarray,
+    cmap: str,
+    extent: tuple[float, float, float, float],
+    title: str,
+    extend: str = "both",
+    domain_outline: tuple[np.ndarray, np.ndarray] | None = None,
+    site: tuple[float, float] | None = (BNF_SITE_LON, BNF_SITE_LAT),
+):
+    ax.set_extent(extent, crs=ccrs.PlateCarree())
+    # Pre-project lon/lat to the axes' own X/Y and call contourf with no
+    # `transform=` kwarg, rather than letting cartopy do it: cartopy's
+    # contourf reprojection drops cells (leaves visible holes) for a
+    # curvilinear grid that's rotated relative to the axes projection --
+    # e.g. HRRR's own Lambert grid plotted on WRF's Lambert axes -- even
+    # though the same grid renders fine with pcolormesh.
+    xyz = ax.projection.transform_points(ccrs.PlateCarree(), lon, lat)
+    x, y = xyz[..., 0], xyz[..., 1]
+    mesh = ax.contourf(x, y, values, levels=levels, cmap=cmap, extend=extend)
+    ax.coastlines(resolution="50m", linewidth=0.8)
+    # Pin an explicit resolution on every feature (BORDERS defaults to
+    # cartopy's AdaptiveScaler, which picks 110m/50m/10m based on each
+    # plot's map extent). Left un-pinned, a domain with a different extent
+    # than previously plotted can make cartopy pick a resolution that
+    # hasn't been downloaded yet and try to fetch it from
+    # naturalearthdata.com mid-plot -- if that network call stalls, it
+    # hangs the whole kernel in a way SIGINT can't reliably interrupt.
+    # Pinning means every plot uses the same, already-cached files.
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.8)
+    ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.5, edgecolor="black")
+    # Explicit dict form (rather than the top_labels/right_labels booleans)
+    # so cartopy doesn't fall back to its per-label nearest-edge geometry
+    # guess, which for a Lambert projection can misplace some longitude
+    # labels on the side panels.
+    gl = ax.gridlines(
+        draw_labels={"bottom": "x", "left": "y"}, linestyle="--", color="gray", alpha=0.5
+    )
+    gl.x_inline = False
+    gl.y_inline = False
+    # Keep longitude labels horizontal and pushed out below the axis,
+    # rather than cartopy's default of rotating them to follow the
+    # (slightly slanted, for a Lambert projection) gridline -- which
+    # otherwise lands them inside the plot near the bottom edge.
+    gl.rotate_labels = False
+    gl.xpadding = 8
+    if domain_outline is not None:
+        outline_lon, outline_lat = domain_outline
+        ax.plot(
+            outline_lon, outline_lat, transform=ccrs.PlateCarree(),
+            color="red", linewidth=0.8, zorder=10,
+        )
+    if site is not None:
+        site_lon, site_lat = site
+        ax.plot(
+            site_lon, site_lat, transform=ccrs.PlateCarree(),
+            marker="*", markersize=10, color="red",
+            markeredgecolor="black", markeredgewidth=0.5, linestyle="none", zorder=11,
+        )
+    ax.set_title(title, fontsize=10)
+    return mesh
+
+
+def _plot_row(
+    fig,
+    axes_row,
+    panels: list[tuple[np.ndarray, np.ndarray, np.ndarray, str]],
+    levels: np.ndarray,
+    cmap: str,
+    extent: tuple[float, float, float, float],
+    domain_outline: tuple[np.ndarray, np.ndarray],
+    extend: str,
+    colorbar_label: str,
+):
+    """Draw one row of side-by-side comparison panels (e.g. WRF / HRRR /
+    obs for the same variable, all on the same levels/cmap), sharing one
+    colorbar. `panels` is a list of (lon, lat, values, title) tuples, one
+    per axes in `axes_row`."""
+    mesh = None
+    for ax, (lon, lat, values, title) in zip(axes_row, panels):
+        mesh = _plot_panel(
+            ax, lon, lat, values, levels, cmap, extent, title,
+            extend=extend, domain_outline=domain_outline,
+        )
+    fig.colorbar(mesh, ax=axes_row[:], label=colorbar_label, shrink=0.5, pad=0.02)
+
+
+def plot_refl_comparison(
+    wrf_file: str | Path,
+    hrrr_file: str | Path,
+    mrms_file: str | Path,
+    refl_levels: np.ndarray = DEFAULT_REFL_LEVELS,
+    refl_cmap: str = "turbo",
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (16, 5.5),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Compare column-max radar reflectivity across WRF, HRRR, and MRMS
+    (observations), at the single time each of the given files holds.
+
+    Unlike the OLR-vs-brightness-temperature situation (see
+    `plot_tb_comparison`), MRMS composite reflectivity is a direct,
+    apples-to-apples match for WRF's simulated reflectivity: same physical
+    quantity (dBZ), same basis as HRRR's `refc` -- see `mrms.py`.
+
+    All three panels are drawn on the same Lambert Conformal projection
+    (taken from the WRF domain) and the same map extent -- derived from
+    the WRF domain's footprint, padded by `domain_pad_deg` -- so they're
+    directly comparable. Because the WRF domain is much smaller than
+    HRRR's/MRMS's, the padded extent extends past the WRF grid on all
+    sides, so the WRF panel shows empty corners; that's expected. The WRF
+    domain's actual footprint is outlined in thin red, and the BNF site is
+    marked with a red star, on every panel.
+
+    `refl_levels` sets the contourf contour intervals (bin edges) and can
+    be overridden per call.
+
+    Parameters
+    ----------
+    wrf_file : path to a wrfout_d0X_* file (single time per file).
+    hrrr_file : path to a HRRR native-level analysis GRIB2 file
+        (hrrr.tHHz.wrfnatf00.grib2).
+    mrms_file : path to a downloaded MRMS composite reflectivity GRIB2.gz
+        file (see `mrms.py`) for a scan time close to `wrf_file`'s.
+    suptitle : if given, drawn as a big figure-level title above all three
+        panels; see `plot_run_refl_comparison` for a wrapper that fills
+        this in automatically.
+    out_file : if given, the figure is saved there; otherwise it's left
+        for the caller to show/save.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    wrf_lon, wrf_lat, wrf_refl, wrf_time = wrf_reader.read_column_max_reflectivity(wrf_file)
+    proj = wrf_reader.get_lambert_projection(wrf_file)
+
+    hrrr_lon, hrrr_lat, hrrr_refl, hrrr_time = hrrr_reader.read_composite_reflectivity(hrrr_file)
+    mrms_lon, mrms_lat, mrms_refl, mrms_time = mrms_reader.read_composite_reflectivity(mrms_file)
+
+    extent = _domain_extent(wrf_lon, wrf_lat, domain_pad_deg)
+    hrrr_lon_c, hrrr_lat_c, hrrr_refl_c = _crop_to_extent(hrrr_lon, hrrr_lat, hrrr_refl, extent)
+    mrms_lon_c, mrms_lat_c, mrms_refl_c = _crop_to_extent(mrms_lon, mrms_lat, mrms_refl, extent)
+    domain_outline = _domain_outline(wrf_lon, wrf_lat)
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+
+    _plot_row(
+        fig, axes,
+        [
+            (wrf_lon, wrf_lat, wrf_refl, "WRF max reflectivity (dBZ)"),
+            (hrrr_lon_c, hrrr_lat_c, hrrr_refl_c, "HRRR composite reflectivity (dBZ)"),
+            (
+                mrms_lon_c, mrms_lat_c, mrms_refl_c,
+                f"MRMS composite reflectivity (dBZ)\n{mrms_time:%Y-%m-%d %H:%M} UTC",
+            ),
+        ],
+        refl_levels, refl_cmap, extent, domain_outline, extend="max", colorbar_label="dBZ",
+    )
+
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=16, fontweight="bold")
+
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150)
+
+    return fig
+
+
+def plot_run_refl_comparison(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    mrms_dir: str | Path = "mrms_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_mrms: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_refl_comparison` that takes a time plus a WRF
+    run's name and directory, locates the matching wrfout/HRRR/MRMS files
+    itself, and labels the figure with a big suptitle showing `run_name`
+    and `time`.
+
+    Parameters
+    ----------
+    time : the output/analysis time to plot, e.g.
+        `datetime.datetime(2025, 9, 16, 1)`, or an ISO string like
+        `"2025-09-16 01:00"`.
+    run_name : label for the run, used in the figure's suptitle (e.g.
+        `"2.5-km (D1) Thompson"`).
+    run_dir : directory holding that run's `wrfout_*` files (e.g.
+        `satoshi_testruns/20250917lassobnfwrfhrrr3/rund1`).
+    hrrr_base_dir : directory holding HRRR native-level GRIB2 files, laid
+        out as `<hrrr_base_dir>/<YYYYMMDD>/hrrr.tHHz.wrfnatf00.grib2`.
+        Defaults to `satoshi_forcing_data/hrrr/hrrrnat_data` relative to
+        the repo root.
+    mrms_dir : directory holding downloaded MRMS composite reflectivity
+        files (as saved by `mrms.download_mrms_file`). Defaults to
+        `mrms_data` relative to wherever this is run from.
+    domain : WRF domain to plot, e.g. "d01" (default) or "d02".
+    output_base_dir : if given (and `out_file` isn't passed explicitly via
+        `**kwargs`), the figure is auto-saved to
+        `<output_base_dir>/wrf_hrrr_mrms_refl_comparison_<run_dir's last
+        two path components>_<time>.png`, creating the directory if
+        needed -- using the directory names rather than `run_name`, since
+        `run_name` is meant as a free-form label and isn't filename-safe.
+    auto_download_mrms : if the matching MRMS file isn't already in
+        `mrms_dir`, fetch it via `mrms.download_mrms_file` instead of
+        raising `FileNotFoundError`. False by default, so plotting never
+        triggers a network download unless you explicitly ask for it.
+    **kwargs : forwarded to `plot_refl_comparison` (e.g. `refl_levels`,
+        `out_file`).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    wrf_file = _find_wrf_file(run_dir, domain, time)
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+
+    mrms_dir = Path(mrms_dir)
+    bucket, key, scan_time = mrms_reader.find_mrms_file(time)
+    mrms_file = mrms_dir / Path(key).name
+    if not mrms_file.exists():
+        if not auto_download_mrms:
+            raise FileNotFoundError(
+                f"No local MRMS file at {mrms_file} for {time} (closest scan "
+                f"{scan_time}); pass auto_download_mrms=True to fetch it here, "
+                f"or download it yourself first with mrms.download_mrms_file."
+            )
+        mrms_file = mrms_reader.download_mrms_file(bucket, key, mrms_dir)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(
+            output_base_dir, "wrf_hrrr_mrms_refl_comparison", run_dir, time
+        )
+
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
+    return plot_refl_comparison(wrf_file, hrrr_file, mrms_file, suptitle=suptitle, **kwargs)
+
+
+def plot_tb_comparison(
+    wrf_file: str | Path,
+    hrrr_file: str | Path,
+    goes_file: str | Path,
+    ctt_levels: np.ndarray = DEFAULT_CTT_LEVELS,
+    cmap: str = "gray_r",
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (16, 5.5),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Compare brightness/cloud-top temperature across WRF, HRRR, and GOES
+    (observations), at the single time each of the given files holds.
+
+    OLR and satellite brightness temperature aren't directly comparable
+    (OLR is a broadband, all-wavelength flux; Tb is a narrowband radiance
+    at one wavelength converted via the Planck function), so this compares
+    three things that *are* the same physical quantity (or a
+    purpose-built model-side analog of it) throughout:
+
+    - WRF: `wrf.read_cloud_top_temperature`'s `ctt` diagnostic --
+      purpose-built as the model-side analog of a clean-window IR
+      channel's Tb.
+    - HRRR: `hrrr.read_simulated_brightness_temperature` -- HRRR/UPP's own
+      CRTM-derived simulated brightness temperature (the same forward-model
+      approach NCEP uses operationally to compare models against
+      satellite).
+    - GOES: `goes.read_brightness_temperature` -- the actual observed
+      channel 13 (10.3 micron, the clean IR window channel) brightness
+      temperature.
+
+    Together this is about as close to an apples-to-apples three-way
+    comparison as is practical without running CRTM/RTTOV on the WRF
+    profiles directly.
+
+    `cmap='gray_r'` (the default) follows the conventional satellite IR
+    display convention: cold cloud tops render white/bright, warm clear
+    sky renders dark.
+
+    Parameters otherwise mirror `plot_refl_comparison` -- see there for
+    `domain_pad_deg`/`out_file` behavior.
+
+    Parameters
+    ----------
+    wrf_file : path to a wrfout_d0X_* file (single time per file).
+    hrrr_file : path to a HRRR native-level analysis GRIB2 file
+        (hrrr.tHHz.wrfnatf00.grib2).
+    goes_file : path to a GOES ABI CMIP NetCDF file (see `goes.py`) for a
+        scan time close to `wrf_file`'s.
+    suptitle : if given, drawn as a big figure-level title above all three
+        panels; see `plot_run_tb_comparison` for a wrapper that fills this
+        in automatically.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    wrf_lon, wrf_lat, wrf_ctt, wrf_time = wrf_reader.read_cloud_top_temperature(wrf_file)
+    proj = wrf_reader.get_lambert_projection(wrf_file)
+
+    hrrr_lon, hrrr_lat, hrrr_tb, hrrr_time = hrrr_reader.read_simulated_brightness_temperature(
+        hrrr_file
+    )
+    goes_lon, goes_lat, goes_tb, goes_time = goes_reader.read_brightness_temperature(goes_file)
+
+    extent = _domain_extent(wrf_lon, wrf_lat, domain_pad_deg)
+    hrrr_lon_c, hrrr_lat_c, hrrr_tb_c = _crop_to_extent(hrrr_lon, hrrr_lat, hrrr_tb, extent)
+    goes_lon_c, goes_lat_c, goes_tb_c = _crop_to_extent(goes_lon, goes_lat, goes_tb, extent)
+    domain_outline = _domain_outline(wrf_lon, wrf_lat)
+
+    fig, axes = plt.subplots(
+        1, 3, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+
+    _plot_row(
+        fig, axes,
+        [
+            (wrf_lon, wrf_lat, wrf_ctt, "WRF cloud-top temperature (K)"),
+            (hrrr_lon_c, hrrr_lat_c, hrrr_tb_c, "HRRR simulated brightness temp. (K)"),
+            (
+                goes_lon_c, goes_lat_c, goes_tb_c,
+                f"GOES brightness temperature (K)\n{goes_time:%Y-%m-%d %H:%M} UTC scan",
+            ),
+        ],
+        ctt_levels, cmap, extent, domain_outline, extend="both", colorbar_label="K",
+    )
+
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=16, fontweight="bold")
+
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150)
+
+    return fig
+
+
+def plot_run_tb_comparison(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    goes_dir: str | Path = "goes_data",
+    channel: int = 13,
+    satellite: str = goes_reader.DEFAULT_SATELLITE,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_goes: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_tb_comparison` that takes a time plus a WRF
+    run's name and directory, locates the matching wrfout/HRRR/GOES files
+    itself, and labels the figure with a big suptitle showing `run_name`
+    and `time`.
+
+    Parameters
+    ----------
+    time : the output/analysis time to plot; see `plot_run_refl_comparison`
+        for accepted forms.
+    run_name : label for the run, used in the figure's suptitle.
+    run_dir : directory holding that run's `wrfout_*` files.
+    hrrr_base_dir : directory holding HRRR native-level GRIB2 files.
+        Defaults to `satoshi_forcing_data/hrrr/hrrrnat_data` relative to
+        the repo root.
+    goes_dir : directory holding downloaded GOES CMIP files (as saved by
+        `goes.download_goes_file`, e.g. named
+        `OR_ABI-L2-CMIPC-M6C13_G19_s...nc`). Defaults to `goes_data`
+        relative to wherever this is run from.
+    channel : GOES ABI channel to compare against (13, the clean IR window
+        channel, by default; see `goes.find_goes_file`).
+    satellite : which GOES satellite/bucket to look in (see
+        `goes.DEFAULT_SATELLITE` for the GOES-16 -> GOES-19 operational
+        switch this defaults around).
+    domain : WRF domain to plot, e.g. "d01" (default) or "d02".
+    output_base_dir : if given (and `out_file` isn't passed explicitly via
+        `**kwargs`), the figure is auto-saved to
+        `<output_base_dir>/wrf_hrrr_goes_tb_comparison_<run_dir's last two
+        path components>_<time>.png`, creating the directory if needed --
+        same convention as `plot_run_refl_comparison`'s `output_base_dir`.
+    auto_download_goes : if the matching GOES file isn't already in
+        `goes_dir`, fetch it via `goes.download_goes_file` instead of
+        raising `FileNotFoundError`. False by default, so plotting never
+        triggers a network download unless you explicitly ask for it.
+    **kwargs : forwarded to `plot_tb_comparison` (e.g. `ctt_levels`,
+        `out_file`).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    wrf_file = _find_wrf_file(run_dir, domain, time)
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+
+    goes_dir = Path(goes_dir)
+    bucket, key, scan_time = goes_reader.find_goes_file(time, channel=channel, satellite=satellite)
+    goes_file = goes_dir / Path(key).name
+    if not goes_file.exists():
+        if not auto_download_goes:
+            raise FileNotFoundError(
+                f"No local GOES file at {goes_file} for {time} (closest scan "
+                f"{scan_time}); pass auto_download_goes=True to fetch it here, "
+                f"or download it yourself first with goes.download_goes_file."
+            )
+        goes_file = goes_reader.download_goes_file(bucket, key, goes_dir)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(
+            output_base_dir, "wrf_hrrr_goes_tb_comparison", run_dir, time
+        )
+
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
+    return plot_tb_comparison(wrf_file, hrrr_file, goes_file, suptitle=suptitle, **kwargs)

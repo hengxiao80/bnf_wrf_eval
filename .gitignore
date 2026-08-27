@@ -8,3 +8,15 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Generated plots/output
+outputs/
+
+# Downloaded satellite/radar observation data
+goes_data/
+mrms_data/
+
+# Symlinks into shared project storage owned by another user -- not part
+# of this repo (see CLAUDE.md).
+/satoshi_forcing_data
+/satoshi_testruns
