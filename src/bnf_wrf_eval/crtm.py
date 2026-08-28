@@ -203,7 +203,25 @@ CLOUD_TYPE_ID = {
 # all defaulting to 1, "first item in list"). We don't have a real
 # land-use classification to map WRF's own vegetation category onto
 # CRTM's, so this uses CRTM's own defaults everywhere rather than
-# guessing a mapping.
+# guessing a mapping (real UPP source for HRRR *does* do this mapping --
+# WRF's own IVGTYP field, using WRF's IGBP-based MODIS-NOAH categories,
+# through a lookup table to CRTM's named IR land-type categories -- a
+# known, scoped improvement, not yet done here).
+#
+# For Water_Type/Snow_Type/Ice_Type specifically, "1" isn't a placeholder
+# guess -- confirmed from the CRTM v2.4.0 User Guide (Table 4.18, "Water,
+# snow, and ice surface subtypes for infrared and visible sensors", which
+# is what applies to our ABI IR channel; microwave sensors don't consult
+# these fields at all): for IR/VIS, CRTM ships exactly
+#   Water_Type: 1 = "sea water" (the *only* IR/VIS water category -- there
+#     is no separate fresh-water IR emissivity dataset to pick; the
+#     fresh-vs-salt distinction is `Salinity`, a continuous physical input
+#     we already set to 0.0 for this inland domain, not a Water_Type index)
+#   Snow_Type: 1 = "old snow", 2 = "new snow"
+#   Ice_Type: 1 = "new ice" (again the *only* IR/VIS ice category -- no
+#     sea-ice-vs-freshwater-ice split exists here either)
+# so `1` for all three is simply CRTM's one-or-only-default IR/VIS choice,
+# not an unverified stand-in.
 DEFAULT_SURFACE_TYPE = 1
 
 _GAS_CONSTANT_DRY_AIR = 287.05  # J/(kg K)
