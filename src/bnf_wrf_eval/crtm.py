@@ -38,13 +38,22 @@ than a single fixed value per hydrometeor category -- see
 the aerosol-aware variant) replicates real UPP source formula-for-formula
 (`_thompson_cloud_categories`), verified by reading UPP's actual
 `CALRAD_WCLOUD_newcrtm.f`. P3 (`mp_physics`=52/53) has no UPP reference
-implementation to match (UPP's public source has no P3 support at all), so
-`_p3_cloud_categories`/`_p3_effective_radius_um` use a simpler, explicitly
-UNVERIFIED monodisperse-spherical-particle approximation instead -- real,
+implementation to match (UPP's public source has no P3 support at all).
+P3's liquid categories (cloud water, rain) instead replicate the Morrison
+2-moment scheme's own formulas (2026-08-28; see
+`_morrison_cloud_effective_radius_um`/`_morrison_rain_effective_radius_um`),
+adopted at the user's request from the actual WRF source used for this
+project's runs -- a real gamma-distribution shape treatment for cloud
+water (Martin et al. 1994), not just a monodisperse assumption. P3's ice
+categories still use `_p3_effective_radius_um`'s simpler, explicitly
+UNVERIFIED monodisperse-spherical-particle approximation -- real,
 physically-motivated inputs (P3's own predicted mass, number, and
 rime-mass/rime-volume fields), but not a reproduction of P3's actual
-internal lookup-table-based size-distribution treatment. Any other
-microphysics scheme still falls back to the original fixed
+internal lookup-table-based size-distribution treatment (P3 does compute
+this internally and could output it directly as `RE_ICE`, confirmed not
+gated behind any namelist flag -- just not in this project's current
+wrfout files; see that function's docstring). Any other microphysics
+scheme still falls back to the original fixed
 `EFFECTIVE_RADIUS_UM` values. Verified end-to-end against all three real
 microphysics configs this project actually uses (Thompson aerosol-aware,
 P3 2-ice-category, P3 1-ice-category-3-moment): correct category counts,
@@ -149,6 +158,7 @@ if it fails).
 from __future__ import annotations
 
 import datetime as dt
+import math
 from pathlib import Path
 
 import netCDF4
@@ -666,18 +676,85 @@ def _thompson_cloud_categories(
     return categories
 
 
+_gamma = np.vectorize(math.gamma, otypes=[float])  # real (non-integer-argument) gamma function
+
+
+def _morrison_cloud_effective_radius_um(
+    q: np.ndarray, n: np.ndarray, air_density: np.ndarray,
+) -> np.ndarray:
+    """Cloud-water effective radius (microns) for P3's liquid category,
+    replicating the Morrison 2-moment scheme's own formula
+    (`module_mp_morr_two_moment.F`'s `PGAM`/`LAMC`/`EFFC`) rather than a
+    monodisperse-sphere approximation -- adopted at the user's explicit
+    request, from the actual WRF source used for this project's runs
+    (`.../wrf480/WRF/phys/module_mp_morr_two_moment.F`, confirmed
+    2026-08-28). P3 and Morrison both predict cloud droplet number
+    (`QNCLOUD`), so Morrison's own droplet-spectrum shape treatment is a
+    reasonable, better-than-monodisperse stand-in for P3's own (here
+    unavailable -- see the module docstring's STATUS note).
+
+    Uses a real gamma-distribution shape parameter (`PGAM`, the Martin et
+    al. 1994 formula relating the distribution's shape to droplet number
+    and air density) rather than Thompson's discrete lookup table or a
+    fixed/monodisperse assumption, so this needs the actual gamma function
+    at non-integer arguments (`_gamma`, `math.gamma` vectorized --
+    deliberately avoids adding scipy as a dependency for just this one
+    formula).
+
+    `q`/`n` are WRF's raw mixing ratios (kg/kg, #/kg) -- `PGAM` needs an
+    absolute droplet number (per cm^3 of air, so multiplied by
+    `air_density`), but `LAMC` only ever uses `n`/`q` as a ratio, so the
+    air-density factor that would convert both to per-volume content
+    cancels out algebraically; passing the raw mixing ratios straight
+    through (as done here) gives the identical result.
+    """
+    q_safe = np.maximum(q, 1e-12)
+    n_safe = np.maximum(n, 1.0)
+
+    n_per_cm3 = n_safe * air_density / 1.0e6
+    pgam = 1.0 / (0.0005714 * n_per_cm3 + 0.2714) ** 2 - 1.0
+    pgam = np.clip(pgam, 2.0, 10.0)
+
+    rhow = 997.0  # kg/m^3, Morrison's own liquid-water density
+    cons26 = np.pi / 6.0 * rhow
+    lamc = (cons26 * n_safe * _gamma(pgam + 4.0) / (q_safe * _gamma(pgam + 1.0))) ** (1.0 / 3.0)
+    lamc = np.clip(lamc, (pgam + 1.0) / 60.0e-6, (pgam + 1.0) / 1.0e-6)  # Morrison's own LAMMIN/LAMMAX
+
+    effr_m = _gamma(pgam + 4.0) / _gamma(pgam + 3.0) / lamc / 2.0
+    return effr_m * 1.0e6
+
+
+def _morrison_rain_effective_radius_um(q: np.ndarray, n: np.ndarray) -> np.ndarray:
+    """Rain effective radius (microns) for P3's rain category, replicating
+    Morrison's own formula (`LAMR`/`EFFR`) -- a simple exponential
+    (fixed shape parameter, mu=0) distribution, unlike cloud water's
+    variable-shape gamma above. See `_morrison_cloud_effective_radius_um`
+    for the broader rationale/sourcing; `q`/`n` are raw mixing ratios here
+    too (`LAMR` only uses them as a ratio, same cancellation as cloud
+    water).
+    """
+    q_safe = np.maximum(q, 1e-12)
+    n_safe = np.maximum(n, 1.0)
+    rhow = 997.0  # kg/m^3, Morrison's own liquid-water density
+    lamr = (np.pi * rhow * n_safe / q_safe) ** (1.0 / 3.0)
+    lamr = np.clip(lamr, 1.0 / 2800.0e-6, 1.0 / 20.0e-6)  # Morrison's own LAMMINR/LAMMAXR
+    effr_m = 3.0 / lamr / 2.0
+    return effr_m * 1.0e6
+
+
 def _p3_effective_radius_um(
     q: np.ndarray,
     n: np.ndarray | None,
     rime_mass: np.ndarray | None,
     rime_volume: np.ndarray | None,
     air_density: np.ndarray,
-    liquid: bool,
 ) -> np.ndarray:
-    """Approximate effective radius (microns) for one P3 mass/number
+    """Approximate effective radius (microns) for one P3 ICE mass/number
     category, assuming monodisperse spherical particles of the predicted
     mean mass (`q`/`n`: mixing ratio and number concentration) and a bulk
-    particle density.
+    particle density. Liquid categories (cloud water, rain) use Morrison's
+    own formulas instead -- see `_morrison_cloud_effective_radius_um`/
+    `_morrison_rain_effective_radius_um`.
 
     UNVERIFIED approximation, clearly weaker than Thompson's UPP-matched
     formulas above: UPP's public source has no P3 support at all to copy
@@ -685,9 +762,9 @@ def _p3_effective_radius_um(
     effective-radius diagnostics use large precomputed multi-dimensional
     lookup tables (as a function of mean size, rime mass fraction, *and*
     rime density) rather than a simple closed-form formula -- this doesn't
-    attempt to reproduce that. For ice categories, particle density is
-    estimated by mass-weighting an assumed unrimed-ice density (917 kg/m^3,
-    solid ice) against the density implied by P3's own predicted rime-mass
+    attempt to reproduce that. Particle density is estimated by
+    mass-weighting an assumed unrimed-ice density (917 kg/m^3, solid ice)
+    against the density implied by P3's own predicted rime-mass
     (`rime_mass`, WRF's `QIR`/`QIR2`) and rime-volume (`rime_volume`,
     `QIB`/`QIB2`) mixing ratios for the rimed portion -- a real,
     physically-motivated use of P3's own rime fields, just not a
@@ -695,23 +772,28 @@ def _p3_effective_radius_um(
     Doesn't use the 3rd-moment/reflectivity field (`QZI`) 3-moment P3
     configs (mp_physics=53) also predict, which would let the assumed
     size-distribution shape vary rather than assuming monodisperse.
+
+    NOTE: P3 itself always computes a real internal effective radius
+    (`diag_effc_3d`/`diag_effi_3d`, wired to WRF's standard `RE_CLOUD`/
+    `RE_ICE` output fields in `module_microphysics_driver.F`) -- confirmed
+    this isn't gated behind any special namelist flag, just not in this
+    project's current wrfout output-variable list. Getting `RE_ICE` added
+    to a future run's output would give P3's *actual* computed ice
+    effective radius directly, superseding this whole approximation.
     """
-    if liquid:
-        rho_particle = np.full_like(q, 1000.0)
+    rho_unrimed = 917.0  # kg/m^3, solid ice
+    if rime_mass is not None and rime_volume is not None:
+        unrimed_mass = np.maximum(q - rime_mass, 0.0)
+        rime_density = np.clip(
+            np.where(
+                rime_volume > 1e-12, rime_mass / np.maximum(rime_volume, 1e-30), rho_unrimed
+            ),
+            50.0, 900.0,
+        )
+        total_volume = unrimed_mass / rho_unrimed + rime_mass / rime_density
+        rho_particle = np.where(q > 1e-12, q / np.maximum(total_volume, 1e-30), rho_unrimed)
     else:
-        rho_unrimed = 917.0  # kg/m^3, solid ice
-        if rime_mass is not None and rime_volume is not None:
-            unrimed_mass = np.maximum(q - rime_mass, 0.0)
-            rime_density = np.clip(
-                np.where(
-                    rime_volume > 1e-12, rime_mass / np.maximum(rime_volume, 1e-30), rho_unrimed
-                ),
-                50.0, 900.0,
-            )
-            total_volume = unrimed_mass / rho_unrimed + rime_mass / rime_density
-            rho_particle = np.where(q > 1e-12, q / np.maximum(total_volume, 1e-30), rho_unrimed)
-        else:
-            rho_particle = np.full_like(q, rho_unrimed)
+        rho_particle = np.full_like(q, rho_unrimed)
 
     q_safe = np.maximum(q, 1e-12)
     n_safe = np.maximum(n, 1.0) if n is not None else np.full_like(q, 1.0e6)
@@ -725,10 +807,14 @@ def _p3_cloud_categories(
     state: dict, air_density: np.ndarray, layer_thickness: np.ndarray, flatten_top_down,
 ) -> list[dict]:
     """P3 microphysics (WRF/UPP `mp_physics`=52/53) cloud category water
-    content + effective radius. See `_p3_effective_radius_um` for the
-    (approximate, UNVERIFIED) effective-radius formula -- unlike Thompson,
-    there's no UPP reference implementation to match, since UPP's public
-    source has no P3 support at all yet.
+    content + effective radius. Liquid categories (cloud water, rain) use
+    Morrison's own formulas (`_morrison_cloud_effective_radius_um`/
+    `_morrison_rain_effective_radius_um`); ice categories use
+    `_p3_effective_radius_um`'s (approximate, UNVERIFIED) formula --
+    unlike Thompson/Morrison, there's no UPP or P3 reference to match for
+    ice, since UPP's public source has no P3 support at all, and P3's own
+    ice effective radius (`RE_ICE`) isn't in this project's wrfout output
+    (see `_p3_effective_radius_um`'s docstring).
 
     P3 has no separate snow/graupel species -- confirmed directly from
     this project's real P3 wrfout files (2026-08-28): only `QICE` (+
@@ -750,14 +836,22 @@ def _p3_cloud_categories(
     qqw = read("QCLOUD")
     if qqw is not None:
         water_content = qqw * rho * layer_thickness
-        effr_um = _p3_effective_radius_um(qqw, read("QNCLOUD"), None, None, rho, liquid=True)
+        nqw = read("QNCLOUD")
+        if nqw is not None:
+            effr_um = _morrison_cloud_effective_radius_um(qqw, nqw, rho)
+        else:
+            effr_um = np.full_like(qqw, EFFECTIVE_RADIUS_UM["liquid"])
         categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
                                 cloud_type=CLOUD_TYPE_ID["liquid"]))
 
     qqr = read("QRAIN")
     if qqr is not None:
         water_content = qqr * rho * layer_thickness
-        effr_um = _p3_effective_radius_um(qqr, read("QNRAIN"), None, None, rho, liquid=True)
+        nqr = read("QNRAIN")
+        if nqr is not None:
+            effr_um = _morrison_rain_effective_radius_um(qqr, nqr)
+        else:
+            effr_um = np.full_like(qqr, EFFECTIVE_RADIUS_UM["rain"])
         categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
                                 cloud_type=CLOUD_TYPE_ID["rain"]))
 
@@ -769,8 +863,7 @@ def _p3_cloud_categories(
             continue
         water_content = qqi * rho * layer_thickness
         effr_um = _p3_effective_radius_um(
-            qqi, read(f"QNICE{suffix}"), read(f"QIR{suffix}"), read(f"QIB{suffix}"),
-            rho, liquid=False,
+            qqi, read(f"QNICE{suffix}"), read(f"QIR{suffix}"), read(f"QIB{suffix}"), rho,
         )
         categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
                                 cloud_type=CLOUD_TYPE_ID["ice"]))

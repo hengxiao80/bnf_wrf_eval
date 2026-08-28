@@ -134,14 +134,24 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     independent of and composable with the chunking). Cloud effective radius and land surface type are now
     microphysics-scheme-aware rather than fixed defaults (`_cloud_categories`; see the module's own STATUS
     docstring for the full picture): Thompson (`mp_physics`=8/28) replicates real UPP source formula-for-formula,
-    verified against UPP's actual `CALRAD_WCLOUD_newcrtm.f`; P3 (`mp_physics`=52/53) has no UPP reference to match
-    (UPP's public source has no P3 support at all) so uses a simpler, explicitly-flagged-unverified approximation
-    instead; this work also caught a real bug where P3 2-ice-category runs' second ice species (`QICE2`) was
-    never being read at all. `Land_Type` now maps WRF's own vegetation category through UPP's real
-    IGBP-to-NPOESS lookup table when available, confirmed against both UPP's source and the CRTM v2.4.0 User
-    Guide. Remaining approximations, individually marked in the code as unverified: the layer-interface pressure
-    approximation, the ozone climatology placeholder, and the P3 effective-radius approximation (the
-    geostationary zenith-angle formula *is* independently verified -- see its docstring).
+    verified against UPP's actual `CALRAD_WCLOUD_newcrtm.f`. P3 (`mp_physics`=52/53) has no UPP reference to
+    match (UPP's public source has no P3 support at all): its liquid categories (cloud water, rain) replicate
+    the Morrison 2-moment scheme's own gamma-distribution formulas instead (from the actual WRF source used for
+    this project's runs), while its ice categories still use a simpler, explicitly-flagged-UNVERIFIED
+    monodisperse approximation -- P3 itself computes a real internal ice effective radius via a genuine
+    multi-dimensional lookup-table interpolation (confirmed by reading `module_mp_p3.F` directly, including the
+    actual lookup table data files), porting that is a substantial undertaking, and it isn't in this project's
+    current wrfout output anyway (`RE_ICE`, confirmed not gated behind any namelist flag -- just not requested
+    in these runs' output list). This work also caught a real bug where P3 2-ice-category runs' second ice
+    species (`QICE2`) was never being read at all. `Land_Type` now maps WRF's own vegetation category through
+    UPP's real IGBP-to-NPOESS lookup table when available, confirmed against both UPP's source and the CRTM
+    v2.4.0 User Guide. Also confirmed directly from UPP's source: HRRR's own CRTM Tb calculation uses *no* real
+    ozone profile at all (`o3=0.0` for WRF-ARW models, "for now" per UPP's own comment) since HRRR's GRIB2 output
+    has no ozone field to read -- our own placeholder climatology is already more complete than UPP's HRRR
+    treatment, so there's no UPP approach to adopt there. Remaining approximations, individually marked in the
+    code as unverified: the layer-interface pressure approximation, the ozone climatology placeholder, and the
+    P3 ice effective-radius approximation (the geostationary zenith-angle formula *is* independently verified --
+    see its docstring).
   - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`
