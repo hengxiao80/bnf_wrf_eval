@@ -16,6 +16,10 @@ outputs/
 goes_data/
 mrms_data/
 
+# Cached CRTM-derived WRF brightness temperature (see crtm.py) -- expensive
+# to recompute, but fully reproducible from the wrfout files, so not tracked.
+crtm_cache/
+
 # Symlinks into shared project storage owned by another user -- not part
 # of this repo (see CLAUDE.md).
 /satoshi_forcing_data
