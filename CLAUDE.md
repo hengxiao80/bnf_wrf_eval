@@ -131,10 +131,17 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     ~145s across 56 chunks with zero NaN). Results are cached to disk under `crtm_cache/` (gitignored, like
     `outputs/`/`goes_data/`/`mrms_data/`) since a full-resolution run is still slow -- a cached result reloads in
     ~0.02s. The `stride` parameter still exists for an even-quicker coarse preview (spatial subsampling,
-    independent of and composable with the chunking). Remaining approximations, individually marked in the code
-    as unverified: the layer-interface pressure approximation, the fixed per-hydrometeor effective radii, and the
-    ozone climatology placeholder (the geostationary zenith-angle formula *is* independently verified -- see its
-    docstring).
+    independent of and composable with the chunking). Cloud effective radius and land surface type are now
+    microphysics-scheme-aware rather than fixed defaults (`_cloud_categories`; see the module's own STATUS
+    docstring for the full picture): Thompson (`mp_physics`=8/28) replicates real UPP source formula-for-formula,
+    verified against UPP's actual `CALRAD_WCLOUD_newcrtm.f`; P3 (`mp_physics`=52/53) has no UPP reference to match
+    (UPP's public source has no P3 support at all) so uses a simpler, explicitly-flagged-unverified approximation
+    instead; this work also caught a real bug where P3 2-ice-category runs' second ice species (`QICE2`) was
+    never being read at all. `Land_Type` now maps WRF's own vegetation category through UPP's real
+    IGBP-to-NPOESS lookup table when available, confirmed against both UPP's source and the CRTM v2.4.0 User
+    Guide. Remaining approximations, individually marked in the code as unverified: the layer-interface pressure
+    approximation, the ozone climatology placeholder, and the P3 effective-radius approximation (the
+    geostationary zenith-angle formula *is* independently verified -- see its docstring).
   - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`

@@ -29,8 +29,43 @@ just "it ran without crashing." Several of the WRF-state -> CRTM-input mapping
 choices remain principled-but-unverified (each marked individually with what
 would need checking): the geostationary zenith-angle formula (though that
 formula itself is independently verified, see its docstring), the
-layer-interface pressure approximation, the fixed per-hydrometeor effective
-radii, and the ozone climatology placeholder.
+layer-interface pressure approximation, and the ozone climatology placeholder.
+
+Cloud effective radius (2026-08-28) is now microphysics-scheme-aware rather
+than a single fixed value per hydrometeor category -- see
+`_cloud_categories`/`_MP_PHYSICS_THOMPSON`/`_MP_PHYSICS_P3`. Thompson
+(`mp_physics`=8/28, this project's "Thompson"-labeled runs are actually 28,
+the aerosol-aware variant) replicates real UPP source formula-for-formula
+(`_thompson_cloud_categories`), verified by reading UPP's actual
+`CALRAD_WCLOUD_newcrtm.f`. P3 (`mp_physics`=52/53) has no UPP reference
+implementation to match (UPP's public source has no P3 support at all), so
+`_p3_cloud_categories`/`_p3_effective_radius_um` use a simpler, explicitly
+UNVERIFIED monodisperse-spherical-particle approximation instead -- real,
+physically-motivated inputs (P3's own predicted mass, number, and
+rime-mass/rime-volume fields), but not a reproduction of P3's actual
+internal lookup-table-based size-distribution treatment. Any other
+microphysics scheme still falls back to the original fixed
+`EFFECTIVE_RADIUS_UM` values. Verified end-to-end against all three real
+microphysics configs this project actually uses (Thompson aerosol-aware,
+P3 2-ice-category, P3 1-ice-category-3-moment): correct category counts,
+zero NaN, physically sane Tb (220-307K) for each. Also fixed a real,
+previously-unnoticed bug this uncovered: P3 2-ice-category runs
+(`mp_physics`=52) predict a *second* ice species (`QICE2`) that the
+original fixed-category code never read at all, silently dropping its
+entire contribution to cloud water content.
+
+`Land_Type` (2026-08-28) is now a real mapping from WRF's own vegetation
+category (`IVGTYP`) through UPP's own IGBP-to-NPOESS lookup table (see
+`_IGBP_TO_NPOESS_LAND_TYPE`) when available, rather than always CRTM's
+generic default -- adopted directly from real UPP source, confirmed
+against the CRTM v2.4.0 User Guide's NPOESS classification table, and
+confirmed NPOESS is in fact the scheme our own CRTM build's `CRTM_Init`
+defaults to loading. `Water_Type`/`Snow_Type`/`Ice_Type` stay at CRTM's
+documented default: confirmed from the User Guide (Table 4.18) that CRTM's
+IR/VIS emissivity model has only one water category ("sea water" -- there's
+no separate fresh-water dataset; the fresh-vs-salt distinction is
+`Salinity`, set separately) and only one ice category ("new ice"), so `1`
+for those isn't a placeholder guess.
 
 `read_simulated_brightness_temperature` now runs at full WRF resolution by
 default (memory-bounded via row-chunking, not spatial subsampling -- see its
@@ -158,14 +193,17 @@ DEFAULT_SAT_LON = -75.2
 DEFAULT_SAT_HEIGHT = 35_786_023.0  # meters above the reference ellipsoid
 EARTH_RADIUS = 6_371_000.0  # meters, spherical approximation
 
-# Fixed per-hydrometeor-category effective radii (microns), following the
-# documented, precedented simplification used in published all-sky
-# assimilation work (rather than a microphysics-scheme-specific formula,
-# which is closer to what UPP itself does but isn't required for a fair
-# comparison here -- see project chat history). CONFIRMED as a legitimate
-# approach via research; these specific numbers should be treated as a
-# reasonable starting point, not something re-derived from a primary
-# source here.
+# Fixed per-hydrometeor-category effective radii (microns), used as a
+# GENERIC FALLBACK for any microphysics scheme that isn't Thompson or P3
+# (see _MP_PHYSICS_THOMPSON/_MP_PHYSICS_P3 and
+# _thompson_cloud_categories/_p3_cloud_categories below, which replace this
+# with real scheme-specific formulas -- confirmed via UPP's own source for
+# Thompson, a documented approximation for P3 since no reference
+# implementation for it exists yet -- see those functions' docstrings).
+# This fallback follows the documented, precedented simplification used in
+# published all-sky assimilation work. CONFIRMED as a legitimate approach
+# via research; these specific numbers should be treated as a reasonable
+# starting point, not something re-derived from a primary source here.
 EFFECTIVE_RADIUS_UM = {
     "liquid": 20.0,
     "ice": 40.0,
@@ -196,17 +234,74 @@ CLOUD_TYPE_ID = {
     "graupel": 5,
 }
 
+# WRF's `MP_PHYSICS` global-attribute values this module has real
+# scheme-specific effective-radius handling for -- see
+# _thompson_cloud_categories/_p3_cloud_categories. Any other value (or a
+# missing MP_PHYSICS attribute) falls back to _generic_cloud_categories's
+# fixed EFFECTIVE_RADIUS_UM values above. Confirmed via real testing which
+# scheme this project's actual runs use (2026-08-28): the "Thompson"-named
+# runs are 28 (Thompson *aerosol-aware*, not plain 8), and the two P3 runs
+# are 52 (2 ice categories, 2-moment cloud water) and 53 (1 ice category,
+# 3-moment ice, 2-moment cloud water) per the run configuration. Other P3
+# mp_physics IDs (WRF also defines 50/51/55 for other P3 category/moment
+# combinations) aren't handled specifically yet -- add them here if a run
+# using one shows up.
+_MP_PHYSICS_THOMPSON = frozenset({8, 28})
+_MP_PHYSICS_P3_1ICE = frozenset({53})  # 1 ice category (some 3-moment)
+_MP_PHYSICS_P3_2ICE = frozenset({52})  # 2 ice categories ("QICE"+"QICE2")
+_MP_PHYSICS_P3 = _MP_PHYSICS_P3_1ICE | _MP_PHYSICS_P3_2ICE
+
+# Extra WRF fields only Thompson or P3 provide, read opportunistically in
+# `_read_wrf_state` (None if this run's scheme doesn't have them):
+#  - Thompson (aerosol-aware, mp_physics=28): QNCLOUD/QNRAIN/QNICE, the
+#    predicted number concentrations UPP's own EFFR() formula uses (plain
+#    Thompson, mp_physics=8, ignores QNCLOUD and uses a fixed cloud-droplet
+#    number instead -- see _thompson_cloud_categories).
+#  - P3 (mp_physics 52/53): QICE/QNICE/QIR/QIB are P3's mass/number/
+#    rime-mass/rime-volume mixing ratios for its (only, or first) ice
+#    category; QICE2/QNICE2/QIR2/QIB2 are the same for P3's *second* ice
+#    category, present only for 2-ice-category configs (mp_physics=52) --
+#    confirmed via real testing that a 1-ice-category run (mp_physics=53)
+#    simply doesn't have these variables at all, not that they're zero.
+#    QZI is P3's predicted 3rd-moment/reflectivity field for 3-moment
+#    configs (mp_physics=53) -- present but not yet used here (see
+#    _p3_effective_radius_um).
+#  - IVGTYP: WRF's vegetation-category index, for a real CRTM Land_Type
+#    mapping (see _IGBP_TO_NPOESS_LAND_TYPE) instead of DEFAULT_SURFACE_TYPE.
+_MP_EXTRA_VARS = (
+    "QNCLOUD", "QNRAIN", "QNICE",
+    "QICE2", "QNICE2", "QIR", "QIB", "QIR2", "QIB2", "QZI",
+    "IVGTYP",
+)
+
+# WRF's WRF's IGBP-based "MODIFIED_IGBP_MODIS_NOAH" vegetation categories
+# (`IVGTYP`, 1-20; confirmed this project's runs use this scheme via each
+# wrfout's own MMINLU global attribute) -> CRTM's NPOESS IR land-surface
+# classification index (1-20; CRTM v2.4.0 User Guide Table 4.13). Adopted
+# directly from real UPP source for HRRR (CALRAD_WCLOUD_newcrtm.f's
+# `model_to_crtm` array, `ivegsrc==1`/IGBP branch), translating UPP's named
+# CRTM constants (PINE_FOREST, BROADLEAF_FOREST, ...) to their actual
+# NPOESS classification-index numbers via that same User Guide table.
+# Confirmed NPOESS (rather than IGBP or USGS) is the right target scheme
+# for our own setup specifically: CRTM_LifeCycle.f90's CRTM_Init defaults
+# `IRlandCoeff_File` to 'NPOESS.IRland.EmisCoeff.bin', and pyCRTM's Fortran
+# wrapper never overrides that argument, so that's what our runs actually
+# load. Indices below are 1-based to match WRF's IVGTYP and CRTM's own
+# convention directly (index 0 unused).
+_IGBP_TO_NPOESS_LAND_TYPE = np.array(
+    [0, 9, 8, 9, 8, 12, 7, 19, 17, 17, 7, 17, 2, 15, 2, 15, 1, 17, 10, 10, 10]
+)
+
 # CRTM's own documented default values for the 6 categorical surface-type
 # slots (`profiles.surfaceTypes[:, 0:6]` = land/soil/vegetation/water/
 # snow/ice type) -- confirmed directly from the installed CRTM source
 # (src/Surface/CRTM_Surface_Define.f90:165-187, DEFAULT_LAND_TYPE etc.,
-# all defaulting to 1, "first item in list"). We don't have a real
-# land-use classification to map WRF's own vegetation category onto
-# CRTM's, so this uses CRTM's own defaults everywhere rather than
-# guessing a mapping (real UPP source for HRRR *does* do this mapping --
-# WRF's own IVGTYP field, using WRF's IGBP-based MODIS-NOAH categories,
-# through a lookup table to CRTM's named IR land-type categories -- a
-# known, scoped improvement, not yet done here).
+# all defaulting to 1, "first item in list"). Used as-is for
+# soil/vegetation/water/snow/ice; land gets a real mapping from WRF's own
+# IVGTYP field instead when available -- see _IGBP_TO_NPOESS_LAND_TYPE and
+# where `_run_crtm_chunk` applies it (adopted directly from real UPP
+# source for HRRR, since we don't have our own land-use classification to
+# map WRF's vegetation category onto CRTM's).
 #
 # For Water_Type/Snow_Type/Ice_Type specifically, "1" isn't a placeholder
 # guess -- confirmed from the CRTM v2.4.0 User Guide (Table 4.18, "Water,
@@ -335,6 +430,15 @@ def _read_wrf_state(wrf_file: str | Path) -> dict:
             var: np.ma.filled(nc.variables[var][0], 0.0) if var in nc.variables else None
             for var in _HYDROMETEOR_VARS
         }
+        # Extra fields only some microphysics schemes provide, read
+        # opportunistically (None if this run's scheme doesn't have them) --
+        # see _thompson_cloud_categories/_p3_cloud_categories for what
+        # consumes each one.
+        extra = {
+            var: (np.ma.filled(nc.variables[var][0], 0.0) if var in nc.variables else None)
+            for var in _MP_EXTRA_VARS
+        }
+        mp_physics = int(nc.MP_PHYSICS) if hasattr(nc, "MP_PHYSICS") else None
         cldfra = np.ma.filled(nc.variables["CLDFRA"][0], 0.0) if "CLDFRA" in nc.variables else None
         ph = np.ma.filled(nc.variables["PH"][0], np.nan)
         phb = np.ma.filled(nc.variables["PHB"][0], np.nan)
@@ -352,7 +456,8 @@ def _read_wrf_state(wrf_file: str | Path) -> dict:
         valid_time = dt.datetime.strptime(time_str, "%Y-%m-%d_%H:%M:%S")
 
     return dict(
-        p=p, t=t, qvapor=qvapor, hydrometeors=hydrometeors, cldfra=cldfra, height=height,
+        p=p, t=t, qvapor=qvapor, hydrometeors=hydrometeors, extra=extra, mp_physics=mp_physics,
+        cldfra=cldfra, height=height,
         psfc=psfc, tsk=tsk, landmask=landmask, hgt=hgt, u10=u10, v10=v10,
         lon=lon, lat=lat, p_top=p_top, valid_time=valid_time,
     )
@@ -377,6 +482,10 @@ def _slice_state(state: dict, row_sel: slice, col_sel: slice) -> dict:
     sliced["hydrometeors"] = {
         var: (data[..., row_sel, col_sel] if data is not None else None)
         for var, data in state["hydrometeors"].items()
+    }
+    sliced["extra"] = {
+        var: (data[..., row_sel, col_sel] if data is not None else None)
+        for var, data in state["extra"].items()
     }
     if state["cldfra"] is not None:
         sliced["cldfra"] = state["cldfra"][..., row_sel, col_sel]
@@ -419,6 +528,292 @@ def _save_cache(
     )
 
 
+def _thompson_cloud_categories(
+    state: dict, air_density: np.ndarray, layer_thickness: np.ndarray, flatten_top_down,
+) -> list[dict]:
+    """Thompson microphysics (WRF/UPP `mp_physics`=8 plain, or 28
+    aerosol-aware) cloud category water content + effective radius,
+    replicating UPP's own `EFFR()` function (`CALRAD_WCLOUD_newcrtm.f`,
+    `NOAA-EMC/UPP`) formula-for-formula rather than using the fixed
+    per-category `EFFECTIVE_RADIUS_UM` fallback -- confirmed via reading
+    UPP's actual source (2026-08-28, see project chat history).
+
+    All five categories use Thompson's own fixed particle density and
+    (except cloud water) fixed distribution-shape parameter (mu=0,
+    exponential) assumptions, so most reduce to closed-form expressions in
+    the predicted mass and (for rain/ice) number concentration; only cloud
+    water's shape parameter varies (via a lookup table on the assumed or
+    predicted droplet number) and only snow uses a genuinely different
+    (temperature-dependent moment-relation) formula, per Thompson's own
+    snow particle-size-distribution parameterization.
+
+    Returns a list of {"water_content", "effective_radius_um",
+    "cloud_type"} dicts (each (n_profiles, nz) except `cloud_type`), one
+    per active category -- the same shape `_run_crtm_chunk` already
+    expects from the generic fallback path.
+    """
+    t_layer = flatten_top_down(state["t"])
+    rho = air_density  # kg/m^3, (n_profiles, nz)
+
+    rhor = 1000.0  # kg/m^3, Thompson's fixed rain/cloud-water (liquid) density
+    rhoi = 890.0  # kg/m^3, Thompson's fixed pristine-ice density
+    rhog = 500.0  # kg/m^3, Thompson's fixed graupel density ("WM Lewis updated rhog to 500 from 400")
+    am_r = np.pi * rhor / 6.0
+    am_i = np.pi * rhoi / 6.0
+    am_g = np.pi * rhog / 6.0
+    nt_c = 100.0e6  # /m^3, fixed cloud-droplet number (plain Thompson, mp_physics=8)
+    # Thompson's own precomputed cloud-PSD shape-function table, indexed by
+    # the diagnosed shape parameter nu_c (1-15) -- copied verbatim from
+    # UPP's EFFR(), not derived here.
+    g_ratio = np.array(
+        [6, 24, 60, 120, 210, 336, 504, 720, 990, 1320, 1716, 2184, 2730, 3360, 4080, 4896],
+        dtype=float,
+    )
+
+    categories: list[dict] = []
+
+    qqw = state["hydrometeors"].get("QCLOUD")
+    if qqw is not None:
+        qqw = flatten_top_down(qqw)
+        water_content = qqw * rho * layer_thickness
+        rc = np.maximum(1e-12, qqw * rho)
+        qncloud = state["extra"].get("QNCLOUD")
+        if state["mp_physics"] == 28 and qncloud is not None:
+            ncc2 = np.maximum(1e-6, flatten_top_down(qncloud) * rho)
+        else:
+            ncc2 = np.full_like(rc, nt_c)
+        nu_c_variable = np.clip(np.round(1000.0e6 / ncc2) + 2, 1, 15).astype(int)
+        nu_c = np.where(ncc2 < 10.0e6, 15, nu_c_variable)
+        lamc = (ncc2 / rc) ** (1.0 / 3.0) * (am_r * g_ratio[nu_c]) ** (1.0 / 3.0)
+        effr_um = 1.0e6 * np.clip((3.0 + nu_c) / lamc, 4.01e-6, 50.0e-6)
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["liquid"]))
+
+    qqr = state["hydrometeors"].get("QRAIN")
+    if qqr is not None:
+        qqr = flatten_top_down(qqr)
+        water_content = qqr * rho * layer_thickness
+        qnrain = state["extra"].get("QNRAIN")
+        if qnrain is not None:
+            rr = np.maximum(1e-12, qqr * rho)
+            ncr2 = np.maximum(1e-6, flatten_top_down(qnrain) * rho)
+            lamr = (ncr2 / rr) ** (1.0 / 3.0) * (am_r * 6.0) ** (1.0 / 3.0)
+            effr_um = 1.0e6 * np.clip(3.0 / lamr, 50.01e-6, 1999.0e-6)
+        else:
+            effr_um = np.full_like(qqr, EFFECTIVE_RADIUS_UM["rain"])
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["rain"]))
+
+    qqi = state["hydrometeors"].get("QICE")
+    if qqi is not None:
+        qqi = flatten_top_down(qqi)
+        water_content = qqi * rho * layer_thickness
+        qnice = state["extra"].get("QNICE")
+        if qnice is not None:
+            ri = np.maximum(1e-12, qqi * rho)
+            nci2 = np.maximum(1e-6, flatten_top_down(qnice) * rho)
+            lami = (nci2 / ri) ** (1.0 / 3.0) * (am_i * 6.0) ** (1.0 / 3.0)
+            effr_um = 1.0e6 * np.clip(3.0 / lami, 10.01e-6, 250.0e-6)
+        else:
+            effr_um = np.full_like(qqi, EFFECTIVE_RADIUS_UM["ice"])
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["ice"]))
+
+    qqs = state["hydrometeors"].get("QSNOW")
+    if qqs is not None:
+        qqs = flatten_top_down(qqs)
+        water_content = qqs * rho * layer_thickness
+        rs = np.maximum(1e-12, qqs * rho)
+        bm_s = 2.0
+        cse1 = bm_s + 1.0  # = 3.0
+        tc0 = np.minimum(-0.1, t_layer - 273.15)
+        smob = rs / 0.069  # am_s = 0.069, Thompson's snow mass-diameter prefactor
+        smo2 = smob  # exact since Thompson's bm_s == 2.0
+        # Thompson's own regression coefficients relating a PSD moment to
+        # temperature and the moment order (cse1) -- copied verbatim from
+        # UPP's EFFR(), not derived here.
+        sa = (5.065339, -0.062659, -3.032362, 0.029469, -0.000285,
+              0.31255, 0.000204, 0.003199, 0.0, -0.015952)
+        sb = (0.476221, -0.015896, 0.165977, 0.007468, -0.000141,
+              0.060366, 0.000079, 0.000594, 0.0, -0.003577)
+        loga = (sa[0] + sa[1] * tc0 + sa[2] * cse1 + sa[3] * tc0 * cse1 + sa[4] * tc0**2
+                + sa[5] * cse1**2 + sa[6] * tc0**2 * cse1 + sa[7] * tc0 * cse1**2
+                + sa[8] * tc0**3 + sa[9] * cse1**3)
+        a = 10.0**loga
+        b = (sb[0] + sb[1] * tc0 + sb[2] * cse1 + sb[3] * tc0 * cse1 + sb[4] * tc0**2
+             + sb[5] * cse1**2 + sb[6] * tc0**2 * cse1 + sb[7] * tc0 * cse1**2
+             + sb[8] * tc0**3 + sb[9] * cse1**3)
+        smoc = a * smo2**b
+        effr_um = 1.0e6 * np.clip(smoc / smob, 50.0e-6, 1999.0e-6)
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["snow"]))
+
+    qqg = state["hydrometeors"].get("QGRAUP")
+    if qqg is not None:
+        qqg = flatten_top_down(qqg)
+        water_content = qqg * rho * layer_thickness
+        rg2 = np.maximum(1e-9, qqg * rho)
+        ygra1 = np.log10(rg2)
+        zans1 = np.clip(3.0 + 2.0 / 7.0 * (ygra1 + 7.0), 2.0, 7.0)
+        no_exp = 10.0**zans1
+        # The remaining shape-parameter factor in UPP's formula reduces to
+        # exactly 1.0 for Thompson's fixed mu_g=0, so lamg == lm_exp.
+        lamg = (no_exp * am_g * 6.0 / rg2) ** 0.25
+        effr_um = 1.0e6 * np.clip(3.0 / lamg, 99.0e-6, 9999.0e-6)
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["graupel"]))
+
+    return categories
+
+
+def _p3_effective_radius_um(
+    q: np.ndarray,
+    n: np.ndarray | None,
+    rime_mass: np.ndarray | None,
+    rime_volume: np.ndarray | None,
+    air_density: np.ndarray,
+    liquid: bool,
+) -> np.ndarray:
+    """Approximate effective radius (microns) for one P3 mass/number
+    category, assuming monodisperse spherical particles of the predicted
+    mean mass (`q`/`n`: mixing ratio and number concentration) and a bulk
+    particle density.
+
+    UNVERIFIED approximation, clearly weaker than Thompson's UPP-matched
+    formulas above: UPP's public source has no P3 support at all to copy
+    from (confirmed via reading it, 2026-08-28), and P3's own internal
+    effective-radius diagnostics use large precomputed multi-dimensional
+    lookup tables (as a function of mean size, rime mass fraction, *and*
+    rime density) rather than a simple closed-form formula -- this doesn't
+    attempt to reproduce that. For ice categories, particle density is
+    estimated by mass-weighting an assumed unrimed-ice density (917 kg/m^3,
+    solid ice) against the density implied by P3's own predicted rime-mass
+    (`rime_mass`, WRF's `QIR`/`QIR2`) and rime-volume (`rime_volume`,
+    `QIB`/`QIB2`) mixing ratios for the rimed portion -- a real,
+    physically-motivated use of P3's own rime fields, just not a
+    reproduction of P3's actual internal size-distribution treatment.
+    Doesn't use the 3rd-moment/reflectivity field (`QZI`) 3-moment P3
+    configs (mp_physics=53) also predict, which would let the assumed
+    size-distribution shape vary rather than assuming monodisperse.
+    """
+    if liquid:
+        rho_particle = np.full_like(q, 1000.0)
+    else:
+        rho_unrimed = 917.0  # kg/m^3, solid ice
+        if rime_mass is not None and rime_volume is not None:
+            unrimed_mass = np.maximum(q - rime_mass, 0.0)
+            rime_density = np.clip(
+                np.where(
+                    rime_volume > 1e-12, rime_mass / np.maximum(rime_volume, 1e-30), rho_unrimed
+                ),
+                50.0, 900.0,
+            )
+            total_volume = unrimed_mass / rho_unrimed + rime_mass / rime_density
+            rho_particle = np.where(q > 1e-12, q / np.maximum(total_volume, 1e-30), rho_unrimed)
+        else:
+            rho_particle = np.full_like(q, rho_unrimed)
+
+    q_safe = np.maximum(q, 1e-12)
+    n_safe = np.maximum(n, 1.0) if n is not None else np.full_like(q, 1.0e6)
+    mass_per_particle = q_safe * air_density / n_safe  # kg
+    volume_per_particle = mass_per_particle / rho_particle  # m^3
+    radius_m = (3.0 * volume_per_particle / (4.0 * np.pi)) ** (1.0 / 3.0)
+    return np.clip(radius_m * 1.0e6, 2.0, 2000.0)  # microns, generously bounded
+
+
+def _p3_cloud_categories(
+    state: dict, air_density: np.ndarray, layer_thickness: np.ndarray, flatten_top_down,
+) -> list[dict]:
+    """P3 microphysics (WRF/UPP `mp_physics`=52/53) cloud category water
+    content + effective radius. See `_p3_effective_radius_um` for the
+    (approximate, UNVERIFIED) effective-radius formula -- unlike Thompson,
+    there's no UPP reference implementation to match, since UPP's public
+    source has no P3 support at all yet.
+
+    P3 has no separate snow/graupel species -- confirmed directly from
+    this project's real P3 wrfout files (2026-08-28): only `QICE` (+
+    `QICE2` for 2-ice-category configs, `mp_physics`=52) exists, no
+    `QSNOW`/`QGRAUP` at all. All of P3's rimed-ice continuum is folded into
+    its ice category/categories instead (via the `QIR`/`QIB` rime-mass/
+    rime-volume fields used in `_p3_effective_radius_um`).
+    """
+    rho = air_density
+
+    def read(var: str) -> np.ndarray | None:
+        data = state["hydrometeors"].get(var)
+        if data is None:
+            data = state["extra"].get(var)
+        return flatten_top_down(data) if data is not None else None
+
+    categories: list[dict] = []
+
+    qqw = read("QCLOUD")
+    if qqw is not None:
+        water_content = qqw * rho * layer_thickness
+        effr_um = _p3_effective_radius_um(qqw, read("QNCLOUD"), None, None, rho, liquid=True)
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["liquid"]))
+
+    qqr = read("QRAIN")
+    if qqr is not None:
+        water_content = qqr * rho * layer_thickness
+        effr_um = _p3_effective_radius_um(qqr, read("QNRAIN"), None, None, rho, liquid=True)
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["rain"]))
+
+    # "" = P3's only/first ice category; "2" = its second, present only
+    # for 2-ice-category configs (mp_physics=52).
+    for suffix in ("", "2"):
+        qqi = read(f"QICE{suffix}")
+        if qqi is None:
+            continue
+        water_content = qqi * rho * layer_thickness
+        effr_um = _p3_effective_radius_um(
+            qqi, read(f"QNICE{suffix}"), read(f"QIR{suffix}"), read(f"QIB{suffix}"),
+            rho, liquid=False,
+        )
+        categories.append(dict(water_content=water_content, effective_radius_um=effr_um,
+                                cloud_type=CLOUD_TYPE_ID["ice"]))
+
+    return categories
+
+
+def _generic_cloud_categories(
+    state: dict, air_density: np.ndarray, layer_thickness: np.ndarray, flatten_top_down,
+) -> list[dict]:
+    """Fixed `EFFECTIVE_RADIUS_UM` fallback for any microphysics scheme
+    that isn't Thompson or P3 (see `_MP_PHYSICS_THOMPSON`/`_MP_PHYSICS_P3`)
+    -- the original approach this module used before scheme-specific
+    formulas were added."""
+    categories: list[dict] = []
+    for var, data in state["hydrometeors"].items():
+        if data is None:
+            continue
+        category = _HYDROMETEOR_CATEGORY[var]
+        mixing_ratio = flatten_top_down(data)
+        water_content = mixing_ratio * air_density * layer_thickness
+        categories.append(dict(
+            water_content=water_content,
+            effective_radius_um=EFFECTIVE_RADIUS_UM[category],
+            cloud_type=CLOUD_TYPE_ID[category],
+        ))
+    return categories
+
+
+def _cloud_categories(
+    state: dict, air_density: np.ndarray, layer_thickness: np.ndarray, flatten_top_down,
+) -> list[dict]:
+    """Dispatch to the right per-microphysics-scheme cloud-category
+    builder based on the run's `MP_PHYSICS` WRF global attribute -- see
+    `_MP_PHYSICS_THOMPSON`/`_MP_PHYSICS_P3`."""
+    mp_physics = state["mp_physics"]
+    if mp_physics in _MP_PHYSICS_THOMPSON:
+        return _thompson_cloud_categories(state, air_density, layer_thickness, flatten_top_down)
+    if mp_physics in _MP_PHYSICS_P3:
+        return _p3_cloud_categories(state, air_density, layer_thickness, flatten_top_down)
+    return _generic_cloud_categories(state, air_density, layer_thickness, flatten_top_down)
+
+
 def _run_crtm_chunk(
     pyCRTM,  # noqa: N803
     profilesCreate,  # noqa: N803
@@ -457,14 +852,16 @@ def _run_crtm_chunk(
 
     air_density = (p_layer * 100.0) / (_GAS_CONSTANT_DRY_AIR * t_layer)  # kg/m^3
 
-    n_clouds = sum(1 for v in state["hydrometeors"].values() if v is not None)
+    # Cloud categories (water content + effective radius + CRTM cloud
+    # type), dispatched by microphysics scheme -- see _cloud_categories.
+    categories = _cloud_categories(state, air_density, layer_thickness, flatten_top_down)
     # nAerosols=0: cleanly excludes aerosol effects (confirmed via
     # pyCRTM's own source: with nAerosols=0, the `aerosols`/`aerosolType`
     # keys are never created, and runDirect() only passes them through if
     # present -- rather than passing default/unset values through an
     # aerosol path we haven't set up).
     profiles = profilesCreate(
-        nProfiles=n_profiles, nLevels=nz, nAerosols=0, nClouds=max(n_clouds, 1)
+        nProfiles=n_profiles, nLevels=nz, nAerosols=0, nClouds=max(len(categories), 1)
     )
 
     zenith = _geostationary_zenith_angle(state["lon"], state["lat"], sat_lon, sat_height)
@@ -529,11 +926,18 @@ def _run_crtm_chunk(
     profiles.surfaceTemperatures[:, 1] = state["tsk"].reshape(n_profiles)
 
     # surfaceTypes is (n_profiles, 6): land/soil/vegetation/water/snow/ice
-    # classification indices. We don't have a real WRF-vegetation-category
-    # -> CRTM-category mapping, so this uses CRTM's own documented
-    # defaults throughout (see DEFAULT_SURFACE_TYPE) rather than inventing
-    # one.
+    # classification indices. Water/snow/ice stay at CRTM's own documented
+    # default (see DEFAULT_SURFACE_TYPE) -- CRTM's IR/VIS emissivity model
+    # only has one water and one ice category, and there's no real snow
+    # classification to map from WRF anyway (see that constant's own
+    # comment). Land gets a real mapping when WRF's vegetation-category
+    # field is available (see _IGBP_TO_NPOESS_LAND_TYPE), defaulting the
+    # same way otherwise.
     profiles.surfaceTypes[:, :] = DEFAULT_SURFACE_TYPE
+    ivgtyp = state["extra"].get("IVGTYP")
+    if ivgtyp is not None:
+        itype = np.clip(ivgtyp.reshape(n_profiles).astype(int), 1, len(_IGBP_TO_NPOESS_LAND_TYPE) - 1)
+        profiles.surfaceTypes[:, 0] = _IGBP_TO_NPOESS_LAND_TYPE[itype]
 
     # profilesCreate() defaults Salinity to NaN (`np.nan * np.zeros(...)`,
     # confirmed from its source), which would feed NaN into CRTM's ocean
@@ -549,19 +953,12 @@ def _run_crtm_chunk(
     # surface roughness/foam in the microwave, not this LW window channel,
     # and this domain is mostly land.
 
-    cloud_idx = 0
     total_water_content = np.zeros((n_profiles, nz))
-    for var, data in state["hydrometeors"].items():
-        if data is None:
-            continue
-        category = _HYDROMETEOR_CATEGORY[var]
-        mixing_ratio = flatten_top_down(data)  # kg/kg
-        water_content = mixing_ratio * air_density * layer_thickness  # kg/m^2 per layer
-        profiles.clouds[:, :, cloud_idx, 0] = water_content
-        profiles.clouds[:, :, cloud_idx, 1] = EFFECTIVE_RADIUS_UM[category]
-        profiles.cloudType[:, cloud_idx] = CLOUD_TYPE_ID[category]
-        total_water_content += water_content
-        cloud_idx += 1
+    for cloud_idx, cat in enumerate(categories):
+        profiles.clouds[:, :, cloud_idx, 0] = cat["water_content"]
+        profiles.clouds[:, :, cloud_idx, 1] = cat["effective_radius_um"]
+        profiles.cloudType[:, cloud_idx] = cat["cloud_type"]
+        total_water_content += cat["water_content"]
 
     # profilesCreate() defaults cloudFraction to all-zero. Left at zero
     # alongside nonzero cloud water content, CRTM's cloud optics produced
