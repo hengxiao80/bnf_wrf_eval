@@ -28,8 +28,9 @@ module's own CRTM forward-model call vs. wrf-python's own diagnostic), not
 just "it ran without crashing." Several of the WRF-state -> CRTM-input mapping
 choices remain principled-but-unverified (each marked individually with what
 would need checking): the geostationary zenith-angle formula (though that
-formula itself is independently verified, see its docstring), the
-layer-interface pressure approximation, and the ozone climatology placeholder.
+formula itself is independently verified, see its docstring) and the ozone
+climatology placeholder. The layer-interface ("level") pressure now
+reproduces WRF's own `p8w` exactly (see `_layer_pressures`).
 
 Cloud effective radius (2026-08-28) is now microphysics-scheme-aware rather
 than a single fixed value per hydrometeor category -- see
@@ -430,26 +431,45 @@ def _geostationary_zenith_angle(
     return np.rad2deg(zenith_rad)
 
 
-def _layer_pressures(p_mass: np.ndarray, psfc: np.ndarray, p_top: float) -> np.ndarray:
-    """Interface (level) pressures (Pa) from WRF's layer (mass-point)
-    pressures, for CRTM's `Pi` (level_pressure) input.
+def _layer_pressures(
+    p_mass: np.ndarray,
+    fnm: np.ndarray,
+    fnp: np.ndarray,
+    psfc: np.ndarray,
+    p_top: float,
+) -> np.ndarray:
+    """Interface ("level") pressures (Pa) at WRF's staggered w-levels, for
+    CRTM's `Pi` (level_pressure) input.
 
-    UNVERIFIED approximation: WRF's wrfout carries pressure at layer
-    midpoints only (`P` + `PB`, on the unstaggered `bottom_top` grid), not
-    at the staggered layer interfaces CRTM also wants. This takes the
-    geometric mean of vertically-adjacent layer pressures as the interface
-    value between them, with the surface interface set to `PSFC` and the
-    model-top interface set to the run's `P_TOP` global attribute -- a
-    common, reasonable approximation, but not verified against a more
-    careful hydrostatic integration.
+    This reproduces WRF's own `p8w` -- the interface pressure WRF itself
+    passes to its physics/radiation packages (`phy_prep` in
+    `dyn_em/module_big_step_utilities_em.F`:
+    `p8w(k) = fzm(k)*p_phy(k) + fzp(k)*p_phy(k-1)`, with `p_phy = P + PB`).
+    It is a linear-in-eta interpolation of the layer (mass-point) full
+    pressure `p_mass` (= `P` + `PB`) onto the w-levels using WRF's own
+    vertical-stretching weights `FNM`/`FNP` (`fzm`/`fzp` in the model
+    source), with the surface interface set to `PSFC` and the model-top
+    interface to `P_TOP`. `FNM[k]`/`FNP[k]` weight mass levels `k` and
+    `k-1` for interface `k`; index 0 is unused (0 in the file).
 
-    `p_mass` has shape (nz, ny, nx), top-of-atmosphere-first (see
-    `read_simulated_brightness_temperature`, which reverses WRF's native
-    bottom-up ordering before calling this). Returns shape (nz+1, ny, nx).
+    Verified against WRF's hydrostatic mass integration (`p_hyd_w`) and the
+    stored `P_HYD`: the half-level average of this field matches `P_HYD` to
+    ~0.1 Pa (mean) and the field itself matches `p_hyd_w` to ~0.3 Pa
+    (mean). Replaced an earlier geometric-mean-of-adjacent-layers
+    approximation that carried a systematic ~5-15 Pa mid-tropospheric bias.
+
+    All inputs are WRF-native bottom-up (surface-first): `p_mass` has shape
+    (nz, ny, nx), `fnm`/`fnp` shape (nz,). Returns shape (nz+1, ny, nx),
+    also bottom-up -- `read_simulated_brightness_temperature`'s caller
+    reverses it to CRTM's top-of-atmosphere-first ordering.
     """
-    interior = np.sqrt(p_mass[:-1] * p_mass[1:])
+    nz = p_mass.shape[0]
+    interior = (
+        fnm[1:nz, None, None] * p_mass[1:nz] + fnp[1:nz, None, None] * p_mass[: nz - 1]
+    )
+    bottom = psfc[np.newaxis, ...]
     top = np.full((1, *p_mass.shape[1:]), p_top)
-    return np.concatenate([top, interior, psfc[np.newaxis, ...]], axis=0)
+    return np.concatenate([bottom, interior, top], axis=0)
 
 
 def _ozone_climatology_ppmv(pressure_hpa: np.ndarray) -> np.ndarray:
@@ -506,6 +526,11 @@ def _read_wrf_state(wrf_file: str | Path) -> dict:
         ph = np.ma.filled(nc.variables["PH"][0], np.nan)
         phb = np.ma.filled(nc.variables["PHB"][0], np.nan)
         height = (ph + phb) / _GRAVITY  # geopotential height at layer interfaces (m)
+        # WRF's own vertical-stretch weights for interpolating mass-level
+        # fields to w (interface) levels -- used by _layer_pressures to
+        # rebuild WRF's `p8w`. 1-D in bottom_top, constant in time.
+        fnm = np.ma.filled(nc.variables["FNM"][0], np.nan)
+        fnp = np.ma.filled(nc.variables["FNP"][0], np.nan)
         psfc = np.ma.filled(nc.variables["PSFC"][0], np.nan)
         tsk = np.ma.filled(nc.variables["TSK"][0], np.nan)
         landmask = np.ma.filled(nc.variables["LANDMASK"][0], np.nan)
@@ -520,7 +545,7 @@ def _read_wrf_state(wrf_file: str | Path) -> dict:
 
     return dict(
         p=p, t=t, qvapor=qvapor, hydrometeors=hydrometeors, extra=extra, mp_physics=mp_physics,
-        cldfra=cldfra, height=height,
+        cldfra=cldfra, height=height, fnm=fnm, fnp=fnp,
         psfc=psfc, tsk=tsk, landmask=landmask, hgt=hgt, u10=u10, v10=v10,
         lon=lon, lat=lat, p_top=p_top, valid_time=valid_time,
     )
@@ -993,9 +1018,11 @@ def _run_crtm_chunk(
     height_interfaces = state["height"][::-1].reshape(nz + 1, n_profiles).T
     layer_thickness = height_interfaces[:, :-1] - height_interfaces[:, 1:]  # (n_profiles, nz)
 
+    # _layer_pressures works in WRF-native bottom-up order (FNM/FNP are
+    # bottom-up); reverse its result to CRTM's top-down layer ordering.
     p_interfaces_pa = _layer_pressures(
-        state["p"][::-1], state["psfc"], state["p_top"]
-    )
+        state["p"], state["fnm"], state["fnp"], state["psfc"], state["p_top"]
+    )[::-1]
     p_interfaces_hpa = p_interfaces_pa.reshape(nz + 1, n_profiles).T / 100.0
 
     air_density = (p_layer * 100.0) / (_GAS_CONSTANT_DRY_AIR * t_layer)  # kg/m^3

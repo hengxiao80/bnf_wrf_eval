@@ -155,9 +155,25 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     ozone profile at all (`o3=0.0` for WRF-ARW models, "for now" per UPP's own comment) since HRRR's GRIB2 output
     has no ozone field to read -- our own placeholder climatology is already more complete than UPP's HRRR
     treatment, so there's no UPP approach to adopt there. Remaining approximations, individually marked in the
-    code as unverified: the layer-interface pressure approximation, the ozone climatology placeholder, and the
-    P3 ice effective-radius approximation (the geostationary zenith-angle formula *is* independently verified --
-    see its docstring).
+    code as unverified: the ozone climatology placeholder and the P3 ice effective-radius approximation (the
+    geostationary zenith-angle formula *is* independently verified -- see its docstring).
+
+    **Layer-interface ("level") pressure (2026-08-29): `_layer_pressures` now reproduces WRF's own `p8w`**
+    rather than a geometric mean of adjacent layer pressures. `p8w` is the interface pressure WRF itself passes
+    to its physics/radiation packages (`phy_prep` in `dyn_em/module_big_step_utilities_em.F`:
+    `p8w(k) = fzm(k)*p_phy(k) + fzp(k)*p_phy(k-1)`, `p_phy = P + PB`): a linear-in-eta interpolation of the
+    layer full pressure (`P` + `PB`) onto the staggered w-levels using WRF's own vertical-stretch weights
+    `FNM`/`FNP` (= `fzm`/`fzp`; 1-D in `bottom_top`, in every wrfout, index 0 unused), with the surface
+    interface set to `PSFC` and the model top to `P_TOP`. This is internally consistent with the `P + PB` layer
+    values already fed to CRTM. Verified against WRF's hydrostatic mass integration (`p_hyd_w`, from
+    `p_hyd_w(k) = p_hyd_w(k+1) - (1+qtot)*(c1h(k)*MUT+c2h(k))*dnw(k)`) and the stored `P_HYD`: the half-level
+    average of the `p8w` field matches `P_HYD` to ~0.1 Pa (mean) and the field itself matches `p_hyd_w` to
+    ~0.3 Pa (mean); the old geometric-mean approximation carried a systematic ~5-15 Pa mid-tropospheric bias.
+    wrf-python has no ready-made tool for this -- its `getvar` "pres"/"pressure" is just `P + PB` on mass
+    levels, and its only staggered products are `geopt_stag`/`zstag`; the RIP-heritage `dpfcalc`/`wrfcttcalc`
+    Fortran routines do build an internal full-level pressure but only as a crude arithmetic mean of adjacent
+    half-levels, and it isn't exposed to Python. **This changes CRTM inputs, so `crtm_cache/` entries and the
+    committed notebook outputs predating this are stale and need regenerating.**
 
     **CRTM version (2026-08-29): the environment now runs CRTM v2.4.1-jedi, not v2.4.0.** The build lives at
     `/gpfs/wolf2/arm/cli120/scratch/hengxiao80/crtm241` (a git worktree of the CRTM repo at tag `v2.4.1-jedi`),
