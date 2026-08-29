@@ -159,6 +159,8 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+import os
+import warnings
 from pathlib import Path
 
 import netCDF4
@@ -169,6 +171,28 @@ import numpy as np
 # since this CRTM release (v2.4.0) predates GOES-19 entirely. See the
 # module docstring for why abi_g16 is the right stand-in.
 SENSOR_ID = "abi_g16"
+
+# CRTM's infrared sea-surface emissivity table. CRTM v2.4.1 added
+# `Nalli2.IRwater.EmisCoeff.bin`, whose defining feature is that emissivity
+# becomes a function of water temperature (the IRSSEv2.2 update, per
+# v2.4.1's own release notes) rather than temperature-independent as in the
+# classic `Nalli.IRwater.EmisCoeff.bin`. pyCRTM hardcodes the classic file
+# (`pyCRTM.py`: `self.IRwaterCoeff_File = 'Nalli.IRwater.EmisCoeff.bin'`),
+# so upgrading the CRTM library alone does NOT pick this up -- confirmed by
+# real testing, where a v2.4.0 -> v2.4.1 upgrade produced bit-identical Tb
+# across all 213,561 pixels precisely because the new table was downloaded
+# but never loaded. Naming it explicitly here is what actually enables the
+# improvement.
+#
+# Only affects water-covered profiles, which are a small minority of this
+# project's inland domain (~1.3% of pixels, measured from LANDMASK), so
+# expect a small but real difference confined to those pixels.
+#
+# Requires a v2.4.1-or-later coefficient set: the v2.4.0 `fix/` release has
+# no Nalli2 file at all. `_ir_water_coeff_file` below falls back to pyCRTM's
+# built-in default (with a warning) rather than failing, so a rollback to
+# the v2.4.0 CRTM/coefficients keeps working.
+IR_WATER_COEFF_FILE = "Nalli2.IRwater.EmisCoeff.bin"
 
 # ABI channel 13, 10.3 micron clean IR window -- same channel goes.py reads
 # observed Tb for, and the same one hrrr.read_simulated_brightness_temperature
@@ -339,6 +363,35 @@ def _get_pycrtm():
     from pyCRTM import profilesCreate, pyCRTM  # noqa: N813
 
     return pyCRTM, profilesCreate
+
+
+def _ir_water_coeff_file(coefficient_path: str, requested: str | None) -> str | None:
+    """Which IR sea-surface emissivity table to ask CRTM for, or None to
+    leave pyCRTM's own hardcoded default alone.
+
+    `requested` of None means "use `IR_WATER_COEFF_FILE`" (the v2.4.1
+    temperature-dependent table -- see that constant). Returns None instead
+    if the file isn't actually present in `coefficient_path`, so that a
+    coefficient set predating v2.4.1 (which has no Nalli2 file) degrades to
+    the classic table rather than failing outright. Warns in that case,
+    since silently getting the old physics while believing you asked for
+    the new physics is exactly the trap that made the CRTM upgrade look
+    like a no-op in the first place.
+    """
+    name = IR_WATER_COEFF_FILE if requested is None else requested
+    if not name:
+        return None
+    if os.path.exists(os.path.join(coefficient_path, name)):
+        return name
+    warnings.warn(
+        f"IR water emissivity table {name!r} not found in {coefficient_path!r}; "
+        "falling back to pyCRTM's default (the temperature-independent "
+        "Nalli table). This is expected on a pre-v2.4.1 coefficient set, "
+        "but means the temperature-dependent water emissivity is NOT in use.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+    return None
 
 
 def _geostationary_zenith_angle(
@@ -917,6 +970,7 @@ def _run_crtm_chunk(
     sat_height: float,
     coefficient_path: str | Path | None,
     n_threads: int = 1,
+    ir_water_coeff_file: str | None = None,
 ) -> np.ndarray:
     """Build CRTM profiles from one (possibly row-chunked) `state` dict and
     run the forward model, returning simulated Tb (K) with shape (ny, nx)
@@ -1084,6 +1138,13 @@ def _run_crtm_chunk(
         # via its source -- there's no env var it reads instead); override
         # the attribute directly if a different location is wanted.
         crtm_ob.coefficientPath = str(coefficient_path) + "/"
+    # Override pyCRTM's hardcoded (temperature-independent) IR sea-surface
+    # emissivity table with v2.4.1's temperature-dependent one -- see
+    # IR_WATER_COEFF_FILE. Resolved against the path actually in effect,
+    # after any coefficient_path override above.
+    resolved_ir_water = _ir_water_coeff_file(crtm_ob.coefficientPath, ir_water_coeff_file)
+    if resolved_ir_water is not None:
+        crtm_ob.IRwaterCoeff_File = resolved_ir_water
     crtm_ob.loadInst()
 
     # Find which output column is `channel`, by nearest-wavelength match
@@ -1111,6 +1172,7 @@ def read_simulated_brightness_temperature(
     use_cache: bool = True,
     recompute: bool = False,
     n_threads: int = 1,
+    ir_water_coeff_file: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
     """CRTM-simulated brightness temperature (K) computed directly from
     WRF's own model state, for `sensor_id`/`channel` (GOES-19 ABI channel
@@ -1176,8 +1238,20 @@ def read_simulated_brightness_temperature(
 
     Note `n_threads` and `max_profiles_per_chunk` are independent knobs
     solving different problems: chunking bounds *memory*, threading cuts
-    *time*. On a large-memory node you can raise `max_profiles_per_chunk`
-    enough to skip chunking entirely and still thread the single call.
+    *time*. Do NOT try to disable chunking by setting
+    `max_profiles_per_chunk` huge, even on a large-memory node: running the
+    whole domain as one CRTM call SEGFAULTS (measured: exit 139 while
+    peaking at only ~49 GB of 250 GB requested, so not an out-of-memory
+    failure), and it is worth only ~5% of runtime anyway. Chunking is
+    load-bearing for stability, not just a memory workaround.
+
+    `ir_water_coeff_file`: which CRTM infrared sea-surface emissivity table
+    to load. None (the default) means `IR_WATER_COEFF_FILE`, v2.4.1's
+    temperature-dependent table -- see that constant for why naming it
+    explicitly is required, and why it silently falls back on older
+    coefficient sets. Pass `"Nalli.IRwater.EmisCoeff.bin"` to force the
+    classic temperature-independent table, or `""` to leave pyCRTM's own
+    default untouched.
 
     Returns (lon, lat, values, valid_time); lon/lat/values share the
     (possibly strided) WRF mass grid's shape (south_north, west_east).
@@ -1199,7 +1273,7 @@ def read_simulated_brightness_temperature(
     if chunk_rows >= ny:
         values = _run_crtm_chunk(
             pyCRTM, profilesCreate, state, sensor_id, channel, sat_lon, sat_height,
-            coefficient_path, n_threads,
+            coefficient_path, n_threads, ir_water_coeff_file,
         )
     else:
         values = np.empty((ny, nx), dtype=float)
@@ -1208,7 +1282,7 @@ def read_simulated_brightness_temperature(
             chunk_state = _slice_state(state, slice(start, end), slice(None))
             values[start:end, :] = _run_crtm_chunk(
                 pyCRTM, profilesCreate, chunk_state, sensor_id, channel,
-                sat_lon, sat_height, coefficient_path, n_threads,
+                sat_lon, sat_height, coefficient_path, n_threads, ir_water_coeff_file,
             )
 
     result = (state["lon"], state["lat"], values, state["valid_time"])

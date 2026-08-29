@@ -122,16 +122,22 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     `.venv`; `pyCRTM` itself isn't declared in `pyproject.toml` (it can only be built against a specific local
     CRTM install path outside this repo) so a bare `uv sync` can silently drop it -- check with
     `uv run python -c "import pyCRTM"` afterward and reinstall per the module docstring if needed. CRTM runs one
-    profile per WRF grid column with no batching, so a single whole-domain call is too large for a login-node's
-    memory budget on the full native WRF grid (e.g. 149 levels x 389x549 columns here, confirmed via real testing:
-    killed by the OS's memory cgroup at ~27GB resident) -- `read_simulated_brightness_temperature` now runs at
-    full resolution by default anyway, transparently splitting the domain into memory-bounded row-chunks and
-    stitching the results back together (numerically exact, since CRTM's forward model is column-independent;
-    verified bit-identical to a non-chunked call on a small case, and a real full-resolution run completed in
-    ~145s across 56 chunks with zero NaN). Results are cached to disk under `crtm_cache/` (gitignored, like
+    profile per WRF grid column with no batching, so `read_simulated_brightness_temperature` splits the domain
+    into row-chunks (`max_profiles_per_chunk`) and stitches the results back together -- numerically exact, since
+    CRTM's forward model is column-independent, verified bit-identical to a non-chunked call. **Do not try to
+    disable chunking**, even on a large-memory node: running the whole domain (149 levels x 389x549 columns) as
+    one CRTM call *segfaults* (measured on a 250GB compute node: exit 139 while peaking at only ~49GB, so not an
+    OOM), and it is worth only ~5% of runtime anyway -- chunking is load-bearing for stability, not just a memory
+    workaround. Results are cached to disk under `crtm_cache/` (gitignored, like
     `outputs/`/`goes_data/`/`mrms_data/`) since a full-resolution run is still slow -- a cached result reloads in
     ~0.02s. The `stride` parameter still exists for an even-quicker coarse preview (spatial subsampling,
-    independent of and composable with the chunking). Cloud effective radius and land surface type are now
+    independent of and composable with the chunking). `n_threads` sets CRTM's OpenMP thread count (pyCRTM
+    defaults it to 1, so runs were single-threaded on a 128-core machine until this was added); measured on a
+    compute node at full resolution, 213,561 profiles: 1 thread 243.6s, 8 threads 73.4s (3.3x), 32 threads 59.0s,
+    64 threads 56.6s (4.3x ceiling) -- **8 is the practical sweet spot**, and every thread count was verified
+    bit-identical to the 1-thread reference. See `scripts/crtm_thread_benchmark.sbatch` for the reproducible
+    SLURM benchmark (SLURM is the live scheduler here; `bsub`/LSF is installed but broken). Cloud effective
+    radius and land surface type are now
     microphysics-scheme-aware rather than fixed defaults (`_cloud_categories`; see the module's own STATUS
     docstring for the full picture): Thompson (`mp_physics`=8/28) replicates real UPP source formula-for-formula,
     verified against UPP's actual `CALRAD_WCLOUD_newcrtm.f`. P3 (`mp_physics`=52/53) has no UPP reference to
@@ -152,6 +158,25 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     code as unverified: the layer-interface pressure approximation, the ozone climatology placeholder, and the
     P3 ice effective-radius approximation (the geostationary zenith-angle formula *is* independently verified --
     see its docstring).
+
+    **CRTM version (2026-08-29): the environment now runs CRTM v2.4.1-jedi, not v2.4.0.** The build lives at
+    `/gpfs/wolf2/arm/cli120/scratch/hengxiao80/crtm241` (a git worktree of the CRTM repo at tag `v2.4.1-jedi`),
+    with v2.4.1 coefficients under `.../scratch/hengxiao80/crtm_fix/fix_REL-2.4.1_20221109/fix`. The v2.4.0
+    install in `~/crtm` is untouched, and `~/crtm/src/pycrtm/setup.cfg.v240-backup` restores the old config, so
+    rollback is: restore that file and rebuild/reinstall pyCRTM. Confirm which version is live with
+    `uv run python -c "import pyCRTM; ..."` -- or just watch for the `CRTM Version: v2.4.x` banner CRTM prints
+    at runtime. Two gotchas found while upgrading, both worth knowing if it is ever redone:
+    (1) v2.4.1's `make.dependencies` omits three real dependencies of the new `CRTM_Active_Sensor.f90`
+    (`CRTM_Atmosphere_Define`, `ODPS_CoordinateMapping`, `CRTM_GeometryInfo_Define`), which races under `make
+    -j` and produces a misleading cascade of "not a field name" errors whose *first* error is really
+    "Error in opening the compiled module file"; patch the dependency line rather than falling back to a serial
+    build. (2) The upgrade alone changes *nothing* numerically -- verified bit-identical Tb (matching SHA-256)
+    across all 213,561 pixels on two cases -- because pyCRTM hardcodes the old temperature-independent IR water
+    emissivity table. `crtm.py`'s `IR_WATER_COEFF_FILE` now explicitly requests v2.4.1's temperature-dependent
+    `Nalli2.IRwater.EmisCoeff.bin`, which is what actually delivers the upgrade's physics: verified to change
+    *only* water pixels (184/187 changed, max 0.021K, mean -0.011K) and leave all 13,337 land pixels
+    bit-identical. It falls back to the classic table with a `RuntimeWarning` if the file is missing, so a
+    rollback to v2.4.0 coefficients keeps working rather than hard-failing.
   - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`
@@ -172,6 +197,10 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     this for real: had to consolidate `notebooks/crtm_cache/` back into `crtm_cache/` after the first full run).
   - `wrf_hrrr_comparison_{20250502,20250520,20250917}_d1.ipynb` -- superseded 2x2 (WRF/HRRR x reflectivity/OLR)
     versions, kept for reference; these call `plot_run_vs_hrrr`, which no longer exists, so they won't run as-is.
+- `scripts/` -- standalone helper scripts not part of the importable package. Currently
+  `crtm_thread_benchmark.sbatch`, the SLURM benchmark documenting CRTM's OpenMP thread scaling (see `crtm.py`
+  above). Note it must use the *main checkout's* `.venv` explicitly: `pyCRTM` is installed only there, and
+  `uv run` from a git worktree silently creates a fresh empty venv instead of finding it.
 - `outputs/`, `goes_data/`, `mrms_data/`, `crtm_cache/` -- generated PNGs / downloaded observation files / cached
   CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored.
 - `satoshi_forcing_data/` and `satoshi_testruns/` -- symlinks into shared project storage
