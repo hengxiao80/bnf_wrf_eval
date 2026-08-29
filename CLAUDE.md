@@ -217,6 +217,9 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   `crtm_thread_benchmark.sbatch`, the SLURM benchmark documenting CRTM's OpenMP thread scaling (see `crtm.py`
   above). Note it must use the *main checkout's* `.venv` explicitly: `pyCRTM` is installed only there, and
   `uv run` from a git worktree silently creates a fresh empty venv instead of finding it.
+- `prompts/` -- the user's task prompts / reference notes for each significant piece of work, kept for
+  provenance (e.g. `CRTM_refinement*.md`, `first_comparision_plot.md`, `p8w.md` -- the WRF `p8w` interface-
+  pressure formulation used to rewrite `crtm.py`'s `_layer_pressures`). Not used by any code.
 - `outputs/`, `goes_data/`, `mrms_data/`, `crtm_cache/` -- generated PNGs / downloaded observation files / cached
   CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored.
 - `satoshi_forcing_data/` and `satoshi_testruns/` -- symlinks into shared project storage
