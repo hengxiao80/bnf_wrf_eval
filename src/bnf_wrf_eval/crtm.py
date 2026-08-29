@@ -916,6 +916,7 @@ def _run_crtm_chunk(
     sat_lon: float,
     sat_height: float,
     coefficient_path: str | Path | None,
+    n_threads: int = 1,
 ) -> np.ndarray:
     """Build CRTM profiles from one (possibly row-chunked) `state` dict and
     run the forward model, returning simulated Tb (K) with shape (ny, nx)
@@ -1068,6 +1069,15 @@ def _run_crtm_chunk(
     crtm_ob = pyCRTM()
     crtm_ob.profiles = profiles
     crtm_ob.sensor_id = sensor_id
+    # pyCRTM defaults nThreads=1 (confirmed from its source), i.e. CRTM's
+    # forward model runs single-threaded unless told otherwise -- which is
+    # what made full-resolution runs slow. CRTM is built here with
+    # `-qopenmp` and parallelizes its profile loop, so raising this is a
+    # near-free speedup on a multi-core node. Numerically irrelevant: the
+    # forward model is column-independent (the same property that makes
+    # `max_profiles_per_chunk` exact), so thread count changes only the
+    # order work is done in, not the result -- verified in real testing.
+    crtm_ob.nThreads = n_threads
     if coefficient_path is not None:
         # pyCRTM.__init__ hardcodes self.coefficientPath from the
         # `path_used` baked into pycrtm_setup.txt at build time (confirmed
@@ -1100,6 +1110,7 @@ def read_simulated_brightness_temperature(
     cache_dir: str | Path | None = "crtm_cache",
     use_cache: bool = True,
     recompute: bool = False,
+    n_threads: int = 1,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
     """CRTM-simulated brightness temperature (K) computed directly from
     WRF's own model state, for `sensor_id`/`channel` (GOES-19 ABI channel
@@ -1150,6 +1161,23 @@ def read_simulated_brightness_temperature(
     recomputing and overwrite it. The cache key does NOT include
     `sat_lon`/`sat_height`/`coefficient_path` -- pass `recompute=True` if
     you change one of those and want a fresh entry rather than a stale one.
+    It also does NOT include `n_threads`, deliberately: thread count only
+    affects speed, never the values (see below).
+
+    `n_threads`: OpenMP threads for CRTM's own profile loop (default 1,
+    matching pyCRTM's own default). CRTM is built here with `-qopenmp`, so
+    raising this is close to free wall-clock speedup on a multi-core node --
+    this machine's login node and every compute node have 128 cores, so the
+    default of 1 leaves nearly all of that idle. Numerically irrelevant:
+    CRTM's forward model is column-independent (the same property that
+    makes `max_profiles_per_chunk` numerically exact), so `n_threads`
+    changes only the order the work is done in, never the answer --
+    verified against real data, not assumed.
+
+    Note `n_threads` and `max_profiles_per_chunk` are independent knobs
+    solving different problems: chunking bounds *memory*, threading cuts
+    *time*. On a large-memory node you can raise `max_profiles_per_chunk`
+    enough to skip chunking entirely and still thread the single call.
 
     Returns (lon, lat, values, valid_time); lon/lat/values share the
     (possibly strided) WRF mass grid's shape (south_north, west_east).
@@ -1170,7 +1198,8 @@ def read_simulated_brightness_temperature(
     chunk_rows = max(1, max_profiles_per_chunk // max(nx, 1))
     if chunk_rows >= ny:
         values = _run_crtm_chunk(
-            pyCRTM, profilesCreate, state, sensor_id, channel, sat_lon, sat_height, coefficient_path
+            pyCRTM, profilesCreate, state, sensor_id, channel, sat_lon, sat_height,
+            coefficient_path, n_threads,
         )
     else:
         values = np.empty((ny, nx), dtype=float)
@@ -1179,7 +1208,7 @@ def read_simulated_brightness_temperature(
             chunk_state = _slice_state(state, slice(start, end), slice(None))
             values[start:end, :] = _run_crtm_chunk(
                 pyCRTM, profilesCreate, chunk_state, sensor_id, channel,
-                sat_lon, sat_height, coefficient_path,
+                sat_lon, sat_height, coefficient_path, n_threads,
             )
 
     result = (state["lon"], state["lat"], values, state["valid_time"])
