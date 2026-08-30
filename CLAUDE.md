@@ -124,11 +124,13 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     `uv run python -c "import pyCRTM"` afterward and reinstall per the module docstring if needed. CRTM runs one
     profile per WRF grid column with no batching, so `read_simulated_brightness_temperature` splits the domain
     into row-chunks (`max_profiles_per_chunk`) and stitches the results back together -- numerically exact, since
-    CRTM's forward model is column-independent, verified bit-identical to a non-chunked call. **Do not try to
-    disable chunking**, even on a large-memory node: running the whole domain (149 levels x 389x549 columns) as
-    one CRTM call *segfaults* (measured on a 250GB compute node: exit 139 while peaking at only ~49GB, so not an
-    OOM), and it is worth only ~5% of runtime anyway -- chunking is load-bearing for stability, not just a memory
-    workaround. Results are cached to disk under `crtm_cache/` (gitignored, like
+    CRTM's forward model is column-independent, verified bit-identical to a non-chunked call. Keep chunking on: it
+    costs almost nothing (see the 2026-08-30 calibration note below -- per-chunk `CRTM_Init` overhead turned out
+    to be negligible, not the "~5% of runtime" once guessed) and it bounds memory (`chunk=8000` -> ~3.5 GB peak
+    vs. ~49 GB for a whole-domain call). An earlier version of this note said a whole-domain call *segfaults*; on
+    the current v2.4.1 build it does not (it runs, just slower and hungrier), so chunking is now a speed/memory
+    choice, not a hard stability crutch -- but see the calibration note for a small-CRTM-call segfault that does
+    still occur. Results are cached to disk under `crtm_cache/` (gitignored, like
     `outputs/`/`goes_data/`/`mrms_data/`) since a full-resolution run is still slow -- a cached result reloads in
     ~0.02s. The `stride` parameter still exists for an even-quicker coarse preview (spatial subsampling,
     independent of and composable with the chunking). `n_threads` sets CRTM's OpenMP thread count (pyCRTM
@@ -172,8 +174,9 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     wrf-python has no ready-made tool for this -- its `getvar` "pres"/"pressure" is just `P + PB` on mass
     levels, and its only staggered products are `geopt_stag`/`zstag`; the RIP-heritage `dpfcalc`/`wrfcttcalc`
     Fortran routines do build an internal full-level pressure but only as a crude arithmetic mean of adjacent
-    half-levels, and it isn't exposed to Python. **This changes CRTM inputs, so `crtm_cache/` entries and the
-    committed notebook outputs predating this are stale and need regenerating.**
+    half-levels, and it isn't exposed to Python. This changed CRTM inputs, so every pre-`p8w` `crtm_cache/` entry
+    was stale; they have since been regenerated wholesale -- see the "CRTM Tb pre-computation" note below. (The
+    committed notebook outputs are still the old ones and would need a re-execute to pick up the new physics.)
 
     **CRTM version (2026-08-29): the environment now runs CRTM v2.4.1-jedi, not v2.4.0.** The build lives at
     `/gpfs/wolf2/arm/cli120/scratch/hengxiao80/crtm241` (a git worktree of the CRTM repo at tag `v2.4.1-jedi`),
@@ -193,6 +196,44 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     *only* water pixels (184/187 changed, max 0.021K, mean -0.011K) and leave all 13,337 land pixels
     bit-identical. It falls back to the classic table with a `RuntimeWarning` if the file is missing, so a
     rollback to v2.4.0 coefficients keeps working rather than hard-failing.
+
+    **CRTM Tb pre-computation (2026-08-30): the forward-model step is now separable from plotting.**
+    `bnf_wrf_eval.crtm_precompute` (run as `python -m bnf_wrf_eval.crtm_precompute`) is a batch driver: it
+    enumerates a run directory's `wrfout_<domain>_*` files (valid time parsed from the name), builds a
+    deterministic flat work list, slices it `[task_index::task_count]` for a SLURM job array (strided, so each
+    task gets an even mix of case days/times), and calls `read_simulated_brightness_temperature` per time --
+    skipping any already in `crtm_cache/` (restartable) and retrying per-file exceptions.
+    `scripts/precompute_crtm_cache.sbatch` + `scripts/precompute_crtm_runs.txt` are the 128-task array that
+    drives it (16 tasks/node x 8 threads, `chunk=8000`, a task-level rerun loop for the segfault below). Used
+    once (job 1023463, 8 nodes, ~47 min) to fill `crtm_cache/` with **all 2601 snapshots** = the 9 d1 HRRR3 runs
+    (`2025{0502,0520,0917}lassobnfwrfhrrr3/{rund1,rund1-mp52,rund1-mp53}`) x every 15-min `wrfout_d01` time
+    (289 each): `ok=2598 skipped=3 failed=0`, zero NaN, all `(389, 549)`, ~6.5 GB on disk.
+
+    Two supporting bits in `crtm.py`:
+    - `CRTM_INPUT_VERSION` (currently `"2026-08-29a"`, covering the `p8w` + `Nalli2` IR-water changes) is now
+      part of every `_cache_path` filename, so a WRF->CRTM mapping change orphans stale `.npz` instead of
+      silently serving them. **Bump it on any future change that alters the Tb for the same wrfout file.**
+    - `require_cache=` makes `read_simulated_brightness_temperature` raise `FileNotFoundError` on a cache miss
+      instead of computing inline, for callers that expect `crtm_precompute` to have run already. Not yet wired
+      into `plotting.py` or the notebooks.
+
+    Calibration (`scripts/crtm_calibration.sbatch` + `crtm_calibration_probe.py`, job 1023455 on a 256 GB
+    `batch_all` node) set the sbatch's numbers and corrected two earlier assumptions:
+    - Full resolution (213,561 profiles), one snapshot: 1 thread 160 s, 2 thr 102 s, 4 thr 71 s, 8 thr 55 s
+      (~2.9x wall). `max_profiles_per_chunk` barely affects speed (a 130-chunk and a 14-chunk run finish within
+      ~4 s), so per-chunk `CRTM_Init` overhead is negligible and there is no speed reason to prefer large chunks.
+    - NOCHUNK did **not** segfault on the v2.4.1 build (ran clean at ~48.6 GB, 83 s) -- the old "whole-domain
+      call segfaults" claim is stale. A rare tbbmalloc SIGSEGV (`ODPS_Predictor_Define.f90`, in CRTM's OpenMP
+      region) *was* seen, but only on very small CRTM calls (<~2000 profiles); every full-resolution run
+      (chunks >= 2000) was stable across ~55 processes and the full 2601-snapshot batch. The sbatch reruns a
+      failed task up to 3x regardless.
+    - Under job-array packing the real limiter is GPFS contention on the 3.4 GB `wrfout` reads (`_read_wrf_state`
+      went from ~3 s solo to ~100 s at 16-wide), not CPU or CRTM: measured throughput ~366 snapshots/hr/node,
+      and 16 tasks/node x 8 threads is the chosen packing.
+  - `crtm_precompute.py` -- batch driver that fills `crtm_cache/` from `crtm.py`'s per-snapshot compute, so
+    plotting only ever reloads `.npz`. See the "CRTM Tb pre-computation" note under `crtm.py` above for the
+    full picture; run as `python -m bnf_wrf_eval.crtm_precompute` (no console-script entry, so `uv sync` can't
+    drop it).
   - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`
@@ -213,15 +254,24 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     this for real: had to consolidate `notebooks/crtm_cache/` back into `crtm_cache/` after the first full run).
   - `wrf_hrrr_comparison_{20250502,20250520,20250917}_d1.ipynb` -- superseded 2x2 (WRF/HRRR x reflectivity/OLR)
     versions, kept for reference; these call `plot_run_vs_hrrr`, which no longer exists, so they won't run as-is.
-- `scripts/` -- standalone helper scripts not part of the importable package. Currently
-  `crtm_thread_benchmark.sbatch`, the SLURM benchmark documenting CRTM's OpenMP thread scaling (see `crtm.py`
-  above). Note it must use the *main checkout's* `.venv` explicitly: `pyCRTM` is installed only there, and
-  `uv run` from a git worktree silently creates a fresh empty venv instead of finding it.
+- `scripts/` -- standalone helper scripts not part of the importable package:
+  - `precompute_crtm_cache.sbatch` + `precompute_crtm_runs.txt` -- the 128-task SLURM job array that drives
+    `bnf_wrf_eval.crtm_precompute` to fill `crtm_cache/` (see the "CRTM Tb pre-computation" note under `crtm.py`).
+  - `crtm_calibration.sbatch` + `crtm_calibration_probe.py` -- the single-node calibration harness whose results
+    (job 1023455) set the pre-compute sbatch's thread/chunk/packing numbers (documented under `crtm.py`).
+  - `crtm_thread_benchmark.sbatch` -- the earlier, narrower SLURM benchmark of CRTM's OpenMP thread scaling;
+    superseded for practical numbers by `crtm_calibration.sbatch` but kept for reference.
+  These must use the *main checkout's* `.venv` explicitly (`pyCRTM` is installed only there, and `uv run` from a
+  git worktree silently creates a fresh empty venv); the two `.sbatch` files take `SRC=`/`RUNS=`/`PROBE=`
+  environment overrides to point at a worktree's code instead.
 - `prompts/` -- the user's task prompts / reference notes for each significant piece of work, kept for
   provenance (e.g. `CRTM_refinement*.md`, `first_comparision_plot.md`, `p8w.md` -- the WRF `p8w` interface-
-  pressure formulation used to rewrite `crtm.py`'s `_layer_pressures`). Not used by any code.
+  pressure formulation used to rewrite `crtm.py`'s `_layer_pressures`; `precalc_crtm.md` -- the ask that led to
+  `crtm_precompute.py` and the calibration/pre-compute sbatch scripts). Not used by any code.
 - `outputs/`, `goes_data/`, `mrms_data/`, `crtm_cache/` -- generated PNGs / downloaded observation files / cached
-  CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored.
+  CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored. `crtm_cache/` is currently fully
+  populated (~6.5 GB) with all 2601 15-min snapshots of the 9 d1 HRRR3 runs, cache-key version `2026-08-29a` --
+  see the "CRTM Tb pre-computation" note under `crtm.py`.
 - `satoshi_forcing_data/` and `satoshi_testruns/` -- symlinks into shared project storage
   (`/gpfs/wolf2/arm/cli120/proj-shared/sey/bnf/wrf/...`), **not part of the git repo** (untracked, and large).
   - `satoshi_forcing_data/` holds reference/forcing datasets (`era5/`, `era5rda/`, `hrrr/`).
