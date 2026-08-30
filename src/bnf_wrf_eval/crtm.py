@@ -195,6 +195,21 @@ SENSOR_ID = "abi_g16"
 # the v2.4.0 CRTM/coefficients keeps working.
 IR_WATER_COEFF_FILE = "Nalli2.IRwater.EmisCoeff.bin"
 
+# Version tag for the WRF-state -> CRTM-input mapping (and the coefficient
+# selection above), embedded in the on-disk cache filename by `_cache_path`.
+# Bump this string whenever a change here alters the simulated Tb for the
+# same wrfout file, so that stale `.npz` cache entries miss the key and get
+# recomputed instead of being silently reused. The CRTM *library* version
+# is not enough on its own -- e.g. the v2.4.0 -> v2.4.1 upgrade was a no-op
+# until IR_WATER_COEFF_FILE was also set (see above), and the `p8w`
+# interface-pressure rewrite changed the inputs with no library change at
+# all. History:
+#   (untagged)   original release (geometric-mean level pressure; pyCRTM's
+#                default temperature-independent IR water table)
+#   2026-08-29a  `_layer_pressures` reproduces WRF's own `p8w`; explicit
+#                v2.4.1 temperature-dependent `Nalli2.IRwater.EmisCoeff.bin`
+CRTM_INPUT_VERSION = "2026-08-29a"
+
 # ABI channel 13, 10.3 micron clean IR window -- same channel goes.py reads
 # observed Tb for, and the same one hrrr.read_simulated_brightness_temperature
 # targets via SBT114. pyCRTM's `runDirect()` computes all of a sensor's
@@ -588,16 +603,21 @@ def _cache_path(
     last two path components, matching `plotting._output_path`'s
     convention, plus the wrfout filename itself, which already embeds the
     domain and valid time) and the parameters that change the result's
-    shape/values (`sensor_id`, `channel`, `stride`). Does NOT depend on
-    `max_profiles_per_chunk` (chunking is purely how the computation is
-    split up, not what's computed) or `sat_lon`/`sat_height`/
+    shape/values (`sensor_id`, `channel`, `stride`, and `CRTM_INPUT_VERSION`
+    -- the WRF-state -> CRTM-input mapping version, so that changing the
+    physics orphans stale entries instead of silently reusing them). Does
+    NOT depend on `max_profiles_per_chunk` (chunking is purely how the
+    computation is split up, not what's computed) or `sat_lon`/`sat_height`/
     `coefficient_path` (rarely varied per call; pass `recompute=True` if
     you do change one of those and want a fresh cache entry rather than a
     stale one)."""
     wrf_file = Path(wrf_file)
     run_dir = wrf_file.parent
     run_label = f"{run_dir.parent.name}_{run_dir.name}"
-    return Path(cache_dir) / f"{run_label}_{wrf_file.name}_{sensor_id}_ch{channel}_stride{stride}.npz"
+    return Path(cache_dir) / (
+        f"{run_label}_{wrf_file.name}_{sensor_id}_ch{channel}"
+        f"_stride{stride}_{CRTM_INPUT_VERSION}.npz"
+    )
 
 
 def _load_cache(cache_path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
@@ -1198,6 +1218,7 @@ def read_simulated_brightness_temperature(
     cache_dir: str | Path | None = "crtm_cache",
     use_cache: bool = True,
     recompute: bool = False,
+    require_cache: bool = False,
     n_threads: int = 1,
     ir_water_coeff_file: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
@@ -1251,7 +1272,15 @@ def read_simulated_brightness_temperature(
     `sat_lon`/`sat_height`/`coefficient_path` -- pass `recompute=True` if
     you change one of those and want a fresh entry rather than a stale one.
     It also does NOT include `n_threads`, deliberately: thread count only
-    affects speed, never the values (see below).
+    affects speed, never the values (see below). It DOES include
+    `CRTM_INPUT_VERSION`, so a physics change orphans old entries.
+
+    `require_cache`: if True, raise `FileNotFoundError` instead of running
+    CRTM when no cache entry exists (implies `cache_dir` must be set). For
+    callers -- plotting, notebooks -- that expect
+    `bnf_wrf_eval.crtm_precompute` to have populated the cache already and
+    want a fast, loud failure rather than silently triggering a minutes-long
+    forward-model run inline.
 
     `n_threads`: OpenMP threads for CRTM's own profile loop (default 1,
     matching pyCRTM's own default). CRTM is built here with `-qopenmp`, so
@@ -1288,6 +1317,13 @@ def read_simulated_brightness_temperature(
         cache_path = _cache_path(wrf_file, cache_dir, sensor_id, channel, stride)
         if use_cache and not recompute and cache_path.exists():
             return _load_cache(cache_path)
+    if require_cache:
+        raise FileNotFoundError(
+            "require_cache=True but no cached CRTM Tb for "
+            f"{Path(wrf_file).name} "
+            + (f"at {cache_path}" if cache_path is not None else "(cache_dir is None)")
+            + " -- run `python -m bnf_wrf_eval.crtm_precompute` for this run first."
+        )
 
     pyCRTM, profilesCreate = _get_pycrtm()  # noqa: N806
 

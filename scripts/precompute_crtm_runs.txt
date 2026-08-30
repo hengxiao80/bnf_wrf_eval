@@ -1,0 +1,19 @@
+# Run directories for `python -m bnf_wrf_eval.crtm_precompute` / the
+# precompute_crtm_cache.sbatch job array. One directory per line; '#'
+# starts a comment. Paths are resolved relative to the sbatch's working
+# directory (the main checkout, which is where the satoshi_testruns
+# symlink and crtm_cache/ live).
+#
+# The d1 HRRR3 runs: 3 case days x 3 microphysics variants (Thompson,
+# P3 mp52 = 2 ice categories, P3 mp53 = 1 ice category 3-moment). Each
+# run has 289 wrfout_d01 files at 15-min spacing (3-day simulations),
+# so this list is 9 x 289 = 2601 snapshots.
+satoshi_testruns/20250502lassobnfwrfhrrr3/rund1
+satoshi_testruns/20250502lassobnfwrfhrrr3/rund1-mp52
+satoshi_testruns/20250502lassobnfwrfhrrr3/rund1-mp53
+satoshi_testruns/20250520lassobnfwrfhrrr3/rund1
+satoshi_testruns/20250520lassobnfwrfhrrr3/rund1-mp52
+satoshi_testruns/20250520lassobnfwrfhrrr3/rund1-mp53
+satoshi_testruns/20250917lassobnfwrfhrrr3/rund1
+satoshi_testruns/20250917lassobnfwrfhrrr3/rund1-mp52
+satoshi_testruns/20250917lassobnfwrfhrrr3/rund1-mp53
