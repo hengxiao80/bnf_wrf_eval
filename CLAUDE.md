@@ -105,9 +105,12 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     `read_olr`, `read_simulated_brightness_temperature`). Lazily bootstraps `eccodes`/`ecmwflibs` on first actual
     use (see `_eccodes_setup.py`) rather than at import time.
   - `goes.py` -- finds/downloads/reads GOES-R ABI Cloud and Moisture Imagery Product (CMIP) brightness
-    temperature from the public `noaa-goes19` AWS Open Data S3 bucket (anonymous, no credentials).
+    temperature from the public `noaa-goes19` AWS Open Data S3 bucket (anonymous, no credentials). `find_goes_file`
+    hits S3 to locate the nearest scan; `find_local_goes_file` resolves an already-downloaded file purely from
+    local filenames (**no network** -- see the compute-node note below). boto3 clients carry connect/read timeouts
+    so a stray S3 call on an offline host fails in seconds instead of hanging.
   - `mrms.py` -- finds/downloads/reads MRMS composite reflectivity from the public `noaa-mrms-pds` AWS Open Data
-    S3 bucket.
+    S3 bucket. `find_local_mrms_file` is the no-network local-filename resolver, same as `goes.py`'s.
   - `crtm.py` -- **working, verified against real WRF output** (2026-08-28): computes simulated GOES-East ABI
     channel 13 Tb directly from WRF's own state via CRTM (through JCSDA's `pyCRTM`), the same forward-model
     approach UPP uses for HRRR's `SBT114` -- for a fairer WRF-vs-HRRR-vs-GOES comparison than
@@ -234,6 +237,19 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     plotting only ever reloads `.npz`. See the "CRTM Tb pre-computation" note under `crtm.py` above for the
     full picture; run as `python -m bnf_wrf_eval.crtm_precompute` (no console-script entry, so `uv sync` can't
     drop it).
+  - `batch_plot.py` -- frame-render driver for the "plots and movies" batch (see the "Plots and movies" note
+    below). Enumerates a deterministic `(plot_type, run|case, time)` work list, slices it `[idx::count]` for a
+    SLURM job array (strided), skips frames already on disk (restartable), retries per-frame exceptions. Renders
+    both the hourly comparison frames (`tb4`, `refl3`) and the six single-panel series (`wrf_tb`, `wrf_refl`,
+    `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`) into `<output-root>/frames/<type>/`. Run as
+    `python -m bnf_wrf_eval.batch_plot --which comparison|single|all|<types>`; `scripts/batch_plot.sbatch` is the
+    64-task array. **The observation files must be local already** (`scripts/download_obs.py`): `batch_plot`
+    resolves them via `find_local_*_file` and never calls S3 on the compute node.
+  - `make_movies.py` -- stitches the `batch_plot` PNGs into per-run / per-case MP4s. Groups frames by everything
+    in the filename before the trailing `_<YYYYMMDD_HHMM>Z.png` stamp, sorts by that stamp, pads each frame on
+    white to the group's max width/height (no rescale -- `bbox_inches="tight"` makes frame sizes vary by a few
+    px), and encodes H.264 (`yuv420p`, 12 fps) via `imageio` + `imageio-ffmpeg`'s bundled static ffmpeg (there is
+    no system `ffmpeg` here). Run as `python -m bnf_wrf_eval.make_movies --which comparison|single|all`.
   - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`
@@ -242,6 +258,24 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     `constrained_layout` padding) -- the 2x2 `figsize` was tuned by computing the real aspect ratio directly
     (`proj.transform_points()` on the extent's corners, not the raw lon/lat degree span) and then verifying
     against the actual rendered PNG.
+    Also has the **single-panel** plotters used by the movies: `plot_single_field` (core) and six wrappers --
+    `plot_run_wrf_tb_single` / `plot_run_wrf_refl_single` (per run, keyed on a run directory) and
+    `plot_case_{hrrr_tb,hrrr_refl,goes_tb,mrms_refl}_single` (per case, keyed on a case label + a `wrf_ref_dir`
+    for the shared, time-independent domain projection/outline/extent). These share the comparison plots'
+    projection / extent / domain-outline / BNF-star conventions and the fixed `DEFAULT_TB_CMAP` /
+    `DEFAULT_*_LEVELS` colour scales (constant across frames, so movies don't flicker). No per-panel axes title;
+    the only label is a suptitle built from the field's *actual* valid/scan time (so a GOES frame reads its 20:02
+    scan, not the requested 20:00). `plot_single_field` draws once, reads the cartopy-shrunk axes box from
+    `ax.get_position()`, and places the colorbar at exactly that height (a plain `constrained_layout` colorbar
+    can't match the aspect-shrunk map). The obs wrappers resolve the observation file **locally first**
+    (`_resolve_goes_file` / `_resolve_mrms_file` -> `find_local_*_file`), only falling back to the S3
+    `find_*_file` when `auto_download_*=True`.
+  - **Compute nodes here have no outbound internet.** Any boto3 S3 call (`goes.find_goes_file`,
+    `mrms.find_mrms_file`, `download_*`) blocks indefinitely on TCP connect there -- this silently hung every
+    task of a plotting job array until the local-filename resolvers above were added. Pre-download all
+    observation files from a login node (`scripts/download_obs.py`), then run `batch_plot` without
+    `--auto-download`. Cartopy Natural Earth features are already cached under `~/.local/share/cartopy` (shared
+    `$HOME`), so those don't fetch.
   - `_eccodes_setup.py` -- works around the pip `eccodes` package not being able to find its own bundled native
     library.
 - `notebooks/` -- one notebook per WRF case day, each running several run/microphysics-scheme variants at one or
@@ -261,20 +295,63 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     (job 1023455) set the pre-compute sbatch's thread/chunk/packing numbers (documented under `crtm.py`).
   - `crtm_thread_benchmark.sbatch` -- the earlier, narrower SLURM benchmark of CRTM's OpenMP thread scaling;
     superseded for practical numbers by `crtm_calibration.sbatch` but kept for reference.
-  These must use the *main checkout's* `.venv` explicitly (`pyCRTM` is installed only there, and `uv run` from a
-  git worktree silently creates a fresh empty venv); the two `.sbatch` files take `SRC=`/`RUNS=`/`PROBE=`
-  environment overrides to point at a worktree's code instead.
+  - `download_obs.py` -- bulk anonymous-S3 prefetch of the GOES ABI ch.13 and MRMS composite-reflectivity files
+    the plots need, for the three case windows, into `goes_data/` / `mrms_data/`. `--hourly` (for the comparison
+    plots) or `--which goes,mrms --cadence-mrms 15` (GOES native ~5 min + MRMS every 15 min, for the single-panel
+    movies). Idempotent. **Run this from a login node before `batch_plot.sbatch`** (compute nodes can't reach S3).
+  - `batch_plot.sbatch` -- 64-task SLURM array (32 concurrent) driving `bnf_wrf_eval.batch_plot`; `WHICH=`
+    (comparison | single | all | type list), `OUTPUT_ROOT=`, `EXTRA=` overrides. Restartable (skips existing
+    frames). ~52 s/frame for the 4-panel `tb4` under 32-wide packing (the `ctt` diagnostic dominates), a few
+    seconds for the single-panel types.
+  The CRTM `.sbatch`/probe scripts must use the *main checkout's* `.venv` explicitly (`pyCRTM` is installed only
+  there, and `uv run` from a git worktree silently creates a fresh empty venv); the two CRTM `.sbatch` files take
+  `SRC=`/`RUNS=`/`PROBE=` environment overrides to point at a worktree's code instead.
 - `prompts/` -- the user's task prompts / reference notes for each significant piece of work, kept for
   provenance (e.g. `CRTM_refinement*.md`, `first_comparision_plot.md`, `p8w.md` -- the WRF `p8w` interface-
   pressure formulation used to rewrite `crtm.py`'s `_layer_pressures`; `precalc_crtm.md` -- the ask that led to
-  `crtm_precompute.py` and the calibration/pre-compute sbatch scripts). Not used by any code.
+  `crtm_precompute.py` and the calibration/pre-compute sbatch scripts; `plots_and_movies.md` -- the ask that led
+  to `batch_plot.py` / `make_movies.py` / `download_obs.py` and the "Plots and movies" note below). Not used by
+  any code.
 - `outputs/`, `goes_data/`, `mrms_data/`, `crtm_cache/` -- generated PNGs / downloaded observation files / cached
   CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored. `crtm_cache/` is currently fully
   populated (~6.5 GB) with all 2601 15-min snapshots of the 9 d1 HRRR3 runs, cache-key version `2026-08-29a` --
-  see the "CRTM Tb pre-computation" note under `crtm.py`.
+  see the "CRTM Tb pre-computation" note under `crtm.py`. `outputs/frames/<type>/` and `outputs/movies/` hold the
+  batch-rendered frames and MP4s -- see the "Plots and movies" note below.
 - `satoshi_forcing_data/` and `satoshi_testruns/` -- symlinks into shared project storage
   (`/gpfs/wolf2/arm/cli120/proj-shared/sey/bnf/wrf/...`), **not part of the git repo** (untracked, and large).
   - `satoshi_forcing_data/` holds reference/forcing datasets (`era5/`, `era5rda/`, `hrrr/`).
   - `satoshi_testruns/` holds WRF LASSO BNF test-run output directories, each named for a config/date
     (e.g. `20250502lassobnfwrfera5ml3`, `20250917lassobnfwrfhrrr2`). These are read-only reference data owned by
     another user (`sey`) — do not modify files under these symlinked paths.
+
+## Plots and movies
+
+Batch-rendered plot frames and the movies made from them, for the 9 d1 HRRR3 runs
+(`2025{0502,0520,0917}lassobnfwrfhrrr3/{rund1,rund1-mp52,rund1-mp53}`, each a 72-h run at 15-min `wrfout_d01`
+output). Driven by `bnf_wrf_eval.batch_plot` (frames) and `bnf_wrf_eval.make_movies` (MP4s); see those modules'
+bullets under "Structure". Task prompt: `prompts/plots_and_movies.md`.
+
+Two families:
+
+- **Hourly comparison** (HRRR analyses are hourly, so these use on-the-hour WRF/GOES/MRMS): `tb4` = the 2x2
+  `plot_run_tb_comparison_4panel` (WRF `ctt` | WRF CRTM | HRRR | GOES) and `refl3` = the 3-panel
+  `plot_run_refl_comparison` (WRF | HRRR | MRMS), 73 frames/run each -> 9 movies each (18 total).
+- **Single-panel**, one field per frame at its native cadence: `wrf_tb` (WRF CRTM Tb) and `wrf_refl` (WRF
+  column-max reflectivity) at 15 min per run (289 frames -> 9 movies each); `hrrr_tb` / `hrrr_refl` hourly per
+  case (73 frames -> 3 movies each); `goes_tb` at GOES CONUS 5 min per case (~865 frames -> 3 movies);
+  `mrms_refl` at 15 min per case (289 frames -> 3 movies). 30 single-panel movies.
+
+48 movies total, H.264 12 fps, in `outputs/movies/<frame-prefix>.mp4`; frames in `outputs/frames/<type>/`.
+
+Regenerate (from a login node -- the download step needs internet, see the compute-node note under `plotting.py`):
+
+    python scripts/download_obs.py --hourly                              # comparison obs
+    python scripts/download_obs.py --which goes,mrms --cadence-mrms 15    # single-panel obs
+    WHICH=comparison sbatch scripts/batch_plot.sbatch                     # then WHICH=single
+    python -m bnf_wrf_eval.make_movies --which all
+
+The one-time full run (2026-08-30): 10,416 frames, 0 failures; comparison array job 1023630 (~19 min), WRF/HRRR
+single-panel array 1023698, GOES/MRMS single-panel array 1023731. Single-panel plots deliberately have **no
+per-panel title**, a suptitle carrying the field's *actual* valid/scan time, a colorbar drawn to the exact
+height of the (aspect-shrunk) map, and colorbar labels `Brightness Temp. (K)` / `Comp. Refl (dBZ)`; the GOES
+suptitle reads `GOES-<n> (#<channel>)`.

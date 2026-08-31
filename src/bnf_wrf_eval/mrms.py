@@ -61,7 +61,15 @@ def find_mrms_file(
     from botocore import UNSIGNED
     from botocore.config import Config
 
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    s3 = boto3.client(
+        "s3",
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
+    )
 
     # Objects are keyed by <day>/<file>, so normally only the target day
     # needs listing; only also check the neighboring day if `time` is
@@ -100,6 +108,48 @@ def find_mrms_file(
     return bucket, best["Key"], best_time
 
 
+def _mrms_scan_time_from_name(name: str) -> dt.datetime:
+    """Scan time parsed from a `MRMS_..._YYYYMMDD-HHMMSS.grib2.gz` filename."""
+    stem = name.removesuffix(".grib2.gz")
+    return dt.datetime.strptime(stem.rsplit("_", 1)[1], "%Y%m%d-%H%M%S")
+
+
+def find_local_mrms_file(
+    time: dt.datetime,
+    mrms_dir: str | Path,
+    tolerance_minutes: float = 10.0,
+) -> Path:
+    """The already-downloaded MRMS file in `mrms_dir` whose scan time is
+    closest to `time`, within `tolerance_minutes` -- resolved purely from
+    local filenames, no S3 call.
+
+    Use this on hosts without outbound internet (compute nodes): the
+    S3-backed `find_mrms_file` blocks forever on `list_objects_v2` there.
+    Pre-populate `mrms_dir` with `scripts/download_obs.py` from a host that
+    has internet.
+
+    Raises FileNotFoundError if nothing matches within tolerance.
+    """
+    mrms_dir = Path(mrms_dir)
+    best: Path | None = None
+    best_delta = None
+    for path in mrms_dir.glob(f"MRMS_{PRODUCT}_*.grib2.gz"):
+        try:
+            scan = _mrms_scan_time_from_name(path.name)
+        except (IndexError, ValueError):
+            continue
+        delta = abs((scan - time).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best, best_delta = path, delta
+    if best is None or best_delta > tolerance_minutes * 60:
+        raise FileNotFoundError(
+            f"No local {PRODUCT} file in {mrms_dir} within {tolerance_minutes} "
+            f"min of {time}"
+            + (f" (closest is {best_delta / 60:.1f} min away)" if best is not None else "")
+        )
+    return best
+
+
 def download_mrms_file(bucket: str, key: str, dest_dir: str | Path) -> Path:
     """Download one S3 object (as found by `find_mrms_file`) into
     `dest_dir`, keeping just its filename (still gzip-compressed -- see
@@ -113,7 +163,15 @@ def download_mrms_file(bucket: str, key: str, dest_dir: str | Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / Path(key).name
     if not dest.exists():
-        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        s3 = boto3.client(
+        "s3",
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
+    )
         s3.download_file(bucket, key, str(dest))
     return dest
 

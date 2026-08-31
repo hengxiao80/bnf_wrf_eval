@@ -130,6 +130,36 @@ def _find_hrrr_file(hrrr_base_dir: str | Path, time: dt.datetime) -> Path:
     return hrrr_file
 
 
+def _resolve_mrms_file(time: dt.datetime, mrms_dir: str | Path, auto_download: bool) -> Path:
+    """Locate the MRMS file for `time`: from local filenames first (no S3
+    call -- works on internet-less compute nodes), falling back to the
+    S3-backed lookup+download only when `auto_download` is set."""
+    mrms_dir = Path(mrms_dir)
+    try:
+        return mrms_reader.find_local_mrms_file(time, mrms_dir)
+    except FileNotFoundError:
+        if not auto_download:
+            raise
+    bucket, key, _ = mrms_reader.find_mrms_file(time)
+    return mrms_reader.download_mrms_file(bucket, key, mrms_dir)
+
+
+def _resolve_goes_file(
+    time: dt.datetime, goes_dir: str | Path, channel: int, satellite: str, auto_download: bool
+) -> Path:
+    """GOES counterpart of `_resolve_mrms_file`."""
+    goes_dir = Path(goes_dir)
+    try:
+        return goes_reader.find_local_goes_file(
+            time, goes_dir, channel=channel, satellite=satellite
+        )
+    except FileNotFoundError:
+        if not auto_download:
+            raise
+    bucket, key, _ = goes_reader.find_goes_file(time, channel=channel, satellite=satellite)
+    return goes_reader.download_goes_file(bucket, key, goes_dir)
+
+
 def _output_path(output_base_dir: str | Path, prefix: str, run_dir: Path, time: dt.datetime) -> Path:
     output_base_dir = Path(output_base_dir)
     output_base_dir.mkdir(parents=True, exist_ok=True)
@@ -370,17 +400,7 @@ def plot_run_refl_comparison(
     wrf_file = _find_wrf_file(run_dir, domain, time)
     hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
 
-    mrms_dir = Path(mrms_dir)
-    bucket, key, scan_time = mrms_reader.find_mrms_file(time)
-    mrms_file = mrms_dir / Path(key).name
-    if not mrms_file.exists():
-        if not auto_download_mrms:
-            raise FileNotFoundError(
-                f"No local MRMS file at {mrms_file} for {time} (closest scan "
-                f"{scan_time}); pass auto_download_mrms=True to fetch it here, "
-                f"or download it yourself first with mrms.download_mrms_file."
-            )
-        mrms_file = mrms_reader.download_mrms_file(bucket, key, mrms_dir)
+    mrms_file = _resolve_mrms_file(time, mrms_dir, auto_download_mrms)
 
     if output_base_dir is not None and "out_file" not in kwargs:
         kwargs["out_file"] = _output_path(
@@ -578,17 +598,7 @@ def plot_run_tb_comparison(
     wrf_file = _find_wrf_file(run_dir, domain, time)
     hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
 
-    goes_dir = Path(goes_dir)
-    bucket, key, scan_time = goes_reader.find_goes_file(time, channel=channel, satellite=satellite)
-    goes_file = goes_dir / Path(key).name
-    if not goes_file.exists():
-        if not auto_download_goes:
-            raise FileNotFoundError(
-                f"No local GOES file at {goes_file} for {time} (closest scan "
-                f"{scan_time}); pass auto_download_goes=True to fetch it here, "
-                f"or download it yourself first with goes.download_goes_file."
-            )
-        goes_file = goes_reader.download_goes_file(bucket, key, goes_dir)
+    goes_file = _resolve_goes_file(time, goes_dir, channel, satellite, auto_download_goes)
 
     if output_base_dir is not None and "out_file" not in kwargs:
         kwargs["out_file"] = _output_path(
@@ -707,17 +717,7 @@ def plot_run_tb_comparison_4panel(
     wrf_file = _find_wrf_file(run_dir, domain, time)
     hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
 
-    goes_dir = Path(goes_dir)
-    bucket, key, scan_time = goes_reader.find_goes_file(time, channel=channel, satellite=satellite)
-    goes_file = goes_dir / Path(key).name
-    if not goes_file.exists():
-        if not auto_download_goes:
-            raise FileNotFoundError(
-                f"No local GOES file at {goes_file} for {time} (closest scan "
-                f"{scan_time}); pass auto_download_goes=True to fetch it here, "
-                f"or download it yourself first with goes.download_goes_file."
-            )
-        goes_file = goes_reader.download_goes_file(bucket, key, goes_dir)
+    goes_file = _resolve_goes_file(time, goes_dir, channel, satellite, auto_download_goes)
 
     if output_base_dir is not None and "out_file" not in kwargs:
         kwargs["out_file"] = _output_path(
@@ -726,3 +726,310 @@ def plot_run_tb_comparison_4panel(
 
     suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
     return plot_tb_comparison_4panel(wrf_file, hrrr_file, goes_file, suptitle=suptitle, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Single-panel plots
+#
+# One field, one map, on the same Lambert projection / map extent / WRF-domain
+# outline + BNF site marker as the comparison plots above, and -- crucially for
+# stitching frames into a movie -- the same fixed color scale
+# (`DEFAULT_CTT_LEVELS` / `DEFAULT_REFL_LEVELS`) for every frame. Used by
+# `bnf_wrf_eval.batch_plot` to render whole time series, one PNG per frame,
+# which `bnf_wrf_eval.make_movies` then encodes.
+#
+# The WRF panels (`plot_run_wrf_tb_single`, `plot_run_wrf_refl_single`) are
+# per-run, keyed on a run directory like the comparison wrappers. The HRRR /
+# GOES / MRMS panels don't depend on the WRF microphysics, so they're keyed on
+# a *case* (a `.../<case_dir>/` holding the per-scheme run subdirs) plus a
+# `wrf_ref_dir` -- any one run subdir, used only to pull the shared domain
+# projection / outline / extent (all time-independent).
+# ---------------------------------------------------------------------------
+
+
+def _first_wrf_file(run_dir: str | Path, domain: str) -> Path:
+    """First (time-sorted) `wrfout_<domain>_*` file in `run_dir` -- for
+    pulling the domain's projection/outline/extent, which don't change with
+    time, without needing a file at one specific time."""
+    files = sorted(Path(run_dir).glob(f"wrfout_{domain}_*"))
+    if not files:
+        raise FileNotFoundError(f"No wrfout_{domain}_* files in {run_dir}")
+    return files[0]
+
+
+def _case_output_path(
+    output_base_dir: str | Path, prefix: str, case_label: str, time: dt.datetime
+) -> Path:
+    output_base_dir = Path(output_base_dir)
+    output_base_dir.mkdir(parents=True, exist_ok=True)
+    return output_base_dir / f"{prefix}_{case_label}_{time:%Y%m%d_%H%MZ}.png"
+
+
+def plot_single_field(
+    lon: np.ndarray,
+    lat: np.ndarray,
+    values: np.ndarray,
+    *,
+    proj,
+    domain_lon: np.ndarray,
+    domain_lat: np.ndarray,
+    levels: np.ndarray,
+    cmap: str | Colormap,
+    extend: str,
+    colorbar_label: str,
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (7.0, 6.0),
+    crop: bool = False,
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Draw one field on one map panel, using the same projection / extent /
+    domain-outline / BNF-site conventions as the comparison plots.
+
+    There is no per-panel axes title -- the only text label is `suptitle`
+    (the model/obs name plus the field's actual valid/scan time, built by
+    the caller). The colorbar is drawn to exactly the height of the
+    rendered map: cartopy shrinks a `set_extent` axes to the data's aspect
+    ratio on draw, so the colorbar axes is placed from `ax.get_position()`
+    *after* a first draw rather than via `constrained_layout` (which can't
+    match that shrunk box).
+
+    `proj` / `domain_lon` / `domain_lat` come from the WRF domain (via
+    `wrf.get_lambert_projection` and `wrf.read_field(..., "HGT")` or an
+    equivalent). `crop=True` slices `lon/lat/values` to the map extent first
+    (do this for the wide HRRR / GOES / MRMS grids; leave it False for WRF's
+    own grid, which already matches).
+    """
+    extent = _domain_extent(domain_lon, domain_lat, domain_pad_deg)
+    if crop:
+        lon, lat, values = _crop_to_extent(lon, lat, values, extent)
+    domain_outline = _domain_outline(domain_lon, domain_lat)
+
+    fig = plt.figure(figsize=figsize)
+    ax = fig.add_axes([0.04, 0.04, 0.84, 0.88], projection=proj)
+    mesh = _plot_panel(
+        ax, lon, lat, values, levels, cmap, extent, "",
+        extend=extend, domain_outline=domain_outline,
+    )
+
+    # First draw so cartopy applies the map aspect and `ax` settles to the
+    # box it actually occupies; then match the colorbar to that box.
+    fig.canvas.draw()
+    pos = ax.get_position()
+    cax = fig.add_axes([pos.x1 + 0.015, pos.y0, 0.022, pos.height])
+    fig.colorbar(mesh, cax=cax, label=colorbar_label)
+
+    if suptitle is not None:
+        fig.text(
+            0.5, min(pos.y1 + 0.035, 0.99), suptitle,
+            ha="center", va="bottom", fontsize=13, fontweight="bold",
+        )
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+
+    return fig
+
+
+def plot_run_wrf_tb_single(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    wrf_tb_kwargs: dict | None = None,
+    **kwargs,
+):
+    """Single-panel WRF CRTM-simulated ABI ch.13 brightness temperature for
+    one run/time. Reads from `crtm_cache/` -- pass
+    `wrf_tb_kwargs={"cache_dir": ..., "require_cache": True}` so a cache miss
+    is a fast, loud error rather than a minutes-long inline CRTM run."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    run_dir = Path(run_dir)
+    wrf_file = _find_wrf_file(run_dir, domain, time)
+
+    domain_lon, domain_lat, _, _ = wrf_reader.read_field(wrf_file, "HGT")
+    proj = wrf_reader.get_lambert_projection(wrf_file)
+    lon, lat, tb, valid_time = crtm_reader.read_simulated_brightness_temperature(
+        wrf_file, **(wrf_tb_kwargs or {})
+    )
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _output_path(output_base_dir, "wrf_crtm_tb", run_dir, time)
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {valid_time:%Y-%m-%d %H:%M} UTC")
+    return plot_single_field(
+        lon, lat, tb, proj=proj, domain_lon=domain_lon, domain_lat=domain_lat,
+        levels=DEFAULT_CTT_LEVELS, cmap=DEFAULT_TB_CMAP, extend="both",
+        colorbar_label="Brightness Temp. (K)",
+        suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
+def plot_run_wrf_refl_single(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    **kwargs,
+):
+    """Single-panel WRF column-max `REFL_10CM` reflectivity for one run/time."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    run_dir = Path(run_dir)
+    wrf_file = _find_wrf_file(run_dir, domain, time)
+
+    proj = wrf_reader.get_lambert_projection(wrf_file)
+    lon, lat, refl, valid_time = wrf_reader.read_column_max_reflectivity(wrf_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _output_path(output_base_dir, "wrf_refl", run_dir, time)
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {valid_time:%Y-%m-%d %H:%M} UTC")
+    levels = kwargs.pop("refl_levels", DEFAULT_REFL_LEVELS)
+    return plot_single_field(
+        lon, lat, refl, proj=proj, domain_lon=lon, domain_lat=lat,
+        levels=levels, cmap=kwargs.pop("refl_cmap", "turbo"), extend="max",
+        colorbar_label="Comp. Refl (dBZ)",
+        suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
+def plot_case_hrrr_tb_single(
+    time: dt.datetime | str,
+    case_label: str,
+    wrf_ref_dir: str | Path,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    **kwargs,
+):
+    """Single-panel HRRR CRTM-simulated brightness temperature (`SBT114`) for
+    one case/time, cropped to the WRF domain's map extent."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    wrf_ref_file = _first_wrf_file(wrf_ref_dir, domain)
+    proj = wrf_reader.get_lambert_projection(wrf_ref_file)
+    domain_lon, domain_lat, _, _ = wrf_reader.read_field(wrf_ref_file, "HGT")
+
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+    lon, lat, tb, valid_time = hrrr_reader.read_simulated_brightness_temperature(hrrr_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _case_output_path(output_base_dir, "hrrr_tb", case_label, time)
+    suptitle = kwargs.pop("suptitle", f"HRRR -- {valid_time:%Y-%m-%d %H:%M} UTC")
+    return plot_single_field(
+        lon, lat, tb, proj=proj, domain_lon=domain_lon, domain_lat=domain_lat,
+        levels=DEFAULT_CTT_LEVELS, cmap=DEFAULT_TB_CMAP, extend="both",
+        colorbar_label="Brightness Temp. (K)",
+        crop=True, suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
+def plot_case_hrrr_refl_single(
+    time: dt.datetime | str,
+    case_label: str,
+    wrf_ref_dir: str | Path,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    **kwargs,
+):
+    """Single-panel HRRR composite reflectivity (`refc`) for one case/time."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    wrf_ref_file = _first_wrf_file(wrf_ref_dir, domain)
+    proj = wrf_reader.get_lambert_projection(wrf_ref_file)
+    domain_lon, domain_lat, _, _ = wrf_reader.read_field(wrf_ref_file, "HGT")
+
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+    lon, lat, refl, valid_time = hrrr_reader.read_composite_reflectivity(hrrr_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _case_output_path(output_base_dir, "hrrr_refl", case_label, time)
+    suptitle = kwargs.pop("suptitle", f"HRRR -- {valid_time:%Y-%m-%d %H:%M} UTC")
+    levels = kwargs.pop("refl_levels", DEFAULT_REFL_LEVELS)
+    return plot_single_field(
+        lon, lat, refl, proj=proj, domain_lon=domain_lon, domain_lat=domain_lat,
+        levels=levels, cmap=kwargs.pop("refl_cmap", "turbo"), extend="max",
+        colorbar_label="Comp. Refl (dBZ)",
+        crop=True, suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
+def plot_case_goes_tb_single(
+    time: dt.datetime | str,
+    case_label: str,
+    wrf_ref_dir: str | Path,
+    goes_dir: str | Path = "goes_data",
+    channel: int = 13,
+    satellite: str = goes_reader.DEFAULT_SATELLITE,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_goes: bool = False,
+    **kwargs,
+):
+    """Single-panel GOES ABI observed brightness temperature for the scan
+    closest to `time`. The saved filename carries the *requested* `time`
+    (a regular grid), not the scan time, so a movie's frames stay evenly
+    spaced even where two grid steps snap to the same scan."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    wrf_ref_file = _first_wrf_file(wrf_ref_dir, domain)
+    proj = wrf_reader.get_lambert_projection(wrf_ref_file)
+    domain_lon, domain_lat, _, _ = wrf_reader.read_field(wrf_ref_file, "HGT")
+
+    goes_file = _resolve_goes_file(time, goes_dir, channel, satellite, auto_download_goes)
+    lon, lat, tb, scan_time = goes_reader.read_brightness_temperature(goes_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _case_output_path(output_base_dir, "goes_tb", case_label, time)
+    sat_num = satellite.lstrip("Gg")
+    suptitle = kwargs.pop(
+        "suptitle", f"GOES-{sat_num} (#{channel}) -- {scan_time:%Y-%m-%d %H:%M} UTC"
+    )
+    return plot_single_field(
+        lon, lat, tb, proj=proj, domain_lon=domain_lon, domain_lat=domain_lat,
+        levels=DEFAULT_CTT_LEVELS, cmap=DEFAULT_TB_CMAP, extend="both",
+        colorbar_label="Brightness Temp. (K)",
+        crop=True, suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
+def plot_case_mrms_refl_single(
+    time: dt.datetime | str,
+    case_label: str,
+    wrf_ref_dir: str | Path,
+    mrms_dir: str | Path = "mrms_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_mrms: bool = False,
+    **kwargs,
+):
+    """Single-panel MRMS composite reflectivity for the scan closest to
+    `time`; filename carries the requested `time` (see
+    `plot_case_goes_tb_single`)."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    wrf_ref_file = _first_wrf_file(wrf_ref_dir, domain)
+    proj = wrf_reader.get_lambert_projection(wrf_ref_file)
+    domain_lon, domain_lat, _, _ = wrf_reader.read_field(wrf_ref_file, "HGT")
+
+    mrms_file = _resolve_mrms_file(time, mrms_dir, auto_download_mrms)
+    lon, lat, refl, scan_time = mrms_reader.read_composite_reflectivity(mrms_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _case_output_path(output_base_dir, "mrms_refl", case_label, time)
+    suptitle = kwargs.pop("suptitle", f"MRMS -- {scan_time:%Y-%m-%d %H:%M} UTC")
+    levels = kwargs.pop("refl_levels", DEFAULT_REFL_LEVELS)
+    return plot_single_field(
+        lon, lat, refl, proj=proj, domain_lon=domain_lon, domain_lat=domain_lat,
+        levels=levels, cmap=kwargs.pop("refl_cmap", "turbo"), extend="max",
+        colorbar_label="Comp. Refl (dBZ)",
+        crop=True, suptitle=suptitle, out_file=out_file, **kwargs,
+    )

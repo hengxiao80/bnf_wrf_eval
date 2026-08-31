@@ -70,7 +70,15 @@ def find_goes_file(
     from botocore.config import Config
 
     bucket = S3_BUCKET_BY_SATELLITE[satellite]
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+    s3 = boto3.client(
+        "s3",
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
+    )
 
     # Objects are keyed by <product>/<year>/<day-of-year>/<hour>/<file>, so
     # list just the target hour (and the ones either side, in case the
@@ -107,6 +115,52 @@ def find_goes_file(
     return bucket, best["Key"], best_time
 
 
+def _goes_scan_start_from_name(name: str) -> dt.datetime:
+    """Scan start time parsed from a CMIP filename's `_sYYYYJJJHHMMSSs` field."""
+    s_field = name.split("_s")[1].split("_")[0]
+    return dt.datetime.strptime(s_field[:-1], "%Y%j%H%M%S")
+
+
+def find_local_goes_file(
+    time: dt.datetime,
+    goes_dir: str | Path,
+    channel: int = 13,
+    satellite: str = DEFAULT_SATELLITE,
+    tolerance_minutes: float = 10.0,
+) -> Path:
+    """The already-downloaded GOES CMIP file in `goes_dir` whose scan start
+    is closest to `time`, within `tolerance_minutes` -- resolved purely from
+    local filenames, with no S3 call.
+
+    Use this on hosts without outbound internet (e.g. compute nodes): the
+    S3-backed `find_goes_file` blocks forever on `list_objects_v2` there.
+    Pre-populate `goes_dir` with `scripts/download_obs.py` from a host that
+    does have internet.
+
+    Raises FileNotFoundError if `goes_dir` holds no matching file within
+    tolerance.
+    """
+    goes_dir = Path(goes_dir)
+    pattern = f"OR_{PRODUCT}-M6C{channel:02d}_{satellite}_s*.nc"
+    best: Path | None = None
+    best_delta = None
+    for path in goes_dir.glob(pattern):
+        try:
+            scan = _goes_scan_start_from_name(path.name)
+        except (IndexError, ValueError):
+            continue
+        delta = abs((scan - time).total_seconds())
+        if best_delta is None or delta < best_delta:
+            best, best_delta = path, delta
+    if best is None or best_delta > tolerance_minutes * 60:
+        raise FileNotFoundError(
+            f"No local {PRODUCT} channel {channel} file in {goes_dir} within "
+            f"{tolerance_minutes} min of {time}"
+            + (f" (closest is {best_delta / 60:.1f} min away)" if best is not None else "")
+        )
+    return best
+
+
 def download_goes_file(bucket: str, key: str, dest_dir: str | Path) -> Path:
     """Download one S3 object (as found by `find_goes_file`) into
     `dest_dir`, keeping just its filename. Skips the download if a file of
@@ -119,7 +173,15 @@ def download_goes_file(bucket: str, key: str, dest_dir: str | Path) -> Path:
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / Path(key).name
     if not dest.exists():
-        s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+        s3 = boto3.client(
+        "s3",
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
+    )
         s3.download_file(bucket, key, str(dest))
     return dest
 

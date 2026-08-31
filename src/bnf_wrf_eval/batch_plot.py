@@ -1,0 +1,379 @@
+"""Batch rendering of the comparison and single-panel plots.
+
+Separates plotting (many independent, ~1-3 s cartopy renders) from movie
+assembly (`bnf_wrf_eval.make_movies`), the same way `crtm_precompute` split
+the CRTM forward model from plotting. Run this to render every frame of
+
+  * the hourly 4-panel Tb comparison (WRF ctt | WRF CRTM | HRRR | GOES) and
+    3-panel reflectivity comparison (WRF | HRRR | MRMS), per run; and
+  * the six single-panel series -- WRF CRTM Tb, WRF reflectivity (both
+    15-min, per run), HRRR Tb, HRRR reflectivity (both hourly, per case),
+    GOES Tb (5-min, per case), MRMS reflectivity (15-min, per case).
+
+Runs as a module (like `crtm_precompute`, deliberately no console-script):
+
+    python -m bnf_wrf_eval.batch_plot --which comparison --output-root outputs
+    python -m bnf_wrf_eval.batch_plot --which single --output-root outputs
+
+`--which` takes `comparison`, `single`, `all`, or any comma-separated list
+of the individual type names (`tb4`, `refl3`, `wrf_tb`, `wrf_refl`,
+`hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`).
+
+The flat work list is deterministically ordered, so `--task-index` /
+`--task-count` (or the `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT` a
+job array sets) slice it `worklist[idx::cnt]` -- strided, so each task gets
+an even mix of types / case days / times. Frames already on disk are
+skipped (restartable); per-frame exceptions are retried then logged and
+skipped so one bad frame does not abort the batch.
+
+Frames land in `<output-root>/frames/<type>/`. The observation files GOES
+Tb and MRMS reflectivity need must already be local (run
+`scripts/download_obs.py` first); pass `--auto-download` to fetch missing
+ones inline instead (races if many tasks want the same missing file, so
+prefer the pre-download).
+
+STATUS (2026-08-30): new. The per-frame plotting functions it drives live
+in `bnf_wrf_eval.plotting` and are the same ones the notebooks use.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import os
+import sys
+import time
+from pathlib import Path
+
+from .crtm_precompute import list_wrfout_times
+from .plotting import _case_output_path, _output_path
+
+DEFAULT_DOMAIN = "d01"
+DEFAULT_RUNS_ROOT = "satoshi_testruns"
+DEFAULT_OUTPUT_ROOT = "outputs"
+DEFAULT_HRRR_DIR = "satoshi_forcing_data/hrrr/hrrrnat_data"
+DEFAULT_GOES_DIR = "goes_data"
+DEFAULT_MRMS_DIR = "mrms_data"
+DEFAULT_CACHE_DIR = "crtm_cache"
+
+# The nine d1 HRRR3 runs: three case days x three microphysics schemes.
+CASES = [
+    "20250502lassobnfwrfhrrr3",
+    "20250520lassobnfwrfhrrr3",
+    "20250917lassobnfwrfhrrr3",
+]
+SCHEMES = {
+    "rund1": "2.5-km (D1) Thompson",
+    "rund1-mp52": "2.5-km (D1) P3 (mp=52)",
+    "rund1-mp53": "2.5-km (D1) P3 (mp=53)",
+}
+REF_SCHEME = "rund1"  # subdir used for the (time-independent) domain geometry
+
+# type -> (scope, cadence-minutes, output-filename prefix). scope "run"
+# iterates every case x scheme; scope "case" iterates case days only.
+TYPES: dict[str, tuple[str, int, str]] = {
+    "tb4": ("run", 60, "wrf_ctt_crtm_hrrr_goes_tb_comparison"),
+    "refl3": ("run", 60, "wrf_hrrr_mrms_refl_comparison"),
+    "wrf_tb": ("run", 15, "wrf_crtm_tb"),
+    "wrf_refl": ("run", 15, "wrf_refl"),
+    "hrrr_tb": ("case", 60, "hrrr_tb"),
+    "hrrr_refl": ("case", 60, "hrrr_refl"),
+    "goes_tb": ("case", 5, "goes_tb"),
+    "mrms_refl": ("case", 15, "mrms_refl"),
+}
+GROUPS = {
+    "comparison": ["tb4", "refl3"],
+    "single": ["wrf_tb", "wrf_refl", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
+    "all": list(TYPES),
+}
+
+
+def _resolve_types(which: str) -> list[str]:
+    names: list[str] = []
+    for token in which.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token in GROUPS:
+            names.extend(GROUPS[token])
+        elif token in TYPES:
+            names.append(token)
+        else:
+            raise SystemExit(f"unknown --which token {token!r}")
+    # de-dupe, keep order
+    seen: set[str] = set()
+    return [n for n in names if not (n in seen or seen.add(n))]
+
+
+def _run_span(run_dir: Path, domain: str) -> tuple[dt.datetime, dt.datetime]:
+    files = list_wrfout_times(run_dir, domain)
+    if not files:
+        raise FileNotFoundError(f"no wrfout_{domain}_* in {run_dir}")
+    from .crtm_precompute import _parse_wrfout_time
+
+    times = [_parse_wrfout_time(f, domain) for f in files]
+    return min(times), max(times)
+
+
+def _time_grid(start: dt.datetime, end: dt.datetime, step_minutes: int) -> list[dt.datetime]:
+    out, t = [], start
+    step = dt.timedelta(minutes=step_minutes)
+    while t <= end:
+        out.append(t)
+        t += step
+    return out
+
+
+def _wrf_times(run_dir: Path, domain: str, cadence_minutes: int) -> list[dt.datetime]:
+    from .crtm_precompute import _parse_wrfout_time
+
+    every = None if cadence_minutes <= 15 else cadence_minutes
+    files = list_wrfout_times(run_dir, domain, every_minutes=every)
+    return [_parse_wrfout_time(f, domain) for f in files]
+
+
+def build_worklist(
+    types: list[str],
+    *,
+    runs_root: str | Path = DEFAULT_RUNS_ROOT,
+    output_root: str | Path = DEFAULT_OUTPUT_ROOT,
+    domain: str = DEFAULT_DOMAIN,
+    start: dt.datetime | None = None,
+    end: dt.datetime | None = None,
+) -> list[tuple]:
+    """Flat, deterministically ordered list of frames to render.
+
+    Each item is `(ptype, key, when, out_path)` where `key` is the run
+    directory (scope "run") or the case label (scope "case")."""
+    runs_root = Path(runs_root)
+    frames_root = Path(output_root) / "frames"
+    items: list[tuple] = []
+
+    for ptype in types:
+        scope, cadence, prefix = TYPES[ptype]
+        out_dir = frames_root / ptype
+
+        if scope == "run":
+            for case in CASES:
+                for scheme in SCHEMES:
+                    run_dir = runs_root / case / scheme
+                    for when in _wrf_times(run_dir, domain, cadence):
+                        if start and when < start:
+                            continue
+                        if end and when > end:
+                            continue
+                        out_path = _output_path(out_dir, prefix, run_dir, when)
+                        items.append((ptype, run_dir, when, out_path))
+        else:  # scope == "case"
+            for case in CASES:
+                ref_dir = runs_root / case / REF_SCHEME
+                if ptype == "goes_tb":
+                    # 5-min regular grid, snapped to the nearest ABI scan
+                    # per frame -- there is no wrfout at :05/:10/... .
+                    span_start, span_end = _run_span(ref_dir, domain)
+                    grid = _time_grid(span_start, span_end, cadence)
+                else:
+                    # HRRR (hourly) and MRMS (15-min): reuse the run's own
+                    # wrfout times so frame counts line up with the WRF
+                    # single-panel series and every time has a match.
+                    grid = _wrf_times(ref_dir, domain, cadence)
+                for when in grid:
+                    if start and when < start:
+                        continue
+                    if end and when > end:
+                        continue
+                    out_path = _case_output_path(out_dir, prefix, case, when)
+                    items.append((ptype, case, when, out_path))
+
+    items.sort(key=lambda it: (it[0], str(it[1]), it[2]))
+    return items
+
+
+def _render(item: tuple, opts: argparse.Namespace) -> None:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    from . import plotting
+
+    ptype, key, when, out_path = item
+    runs_root = Path(opts.runs_root)
+    try:
+        if ptype == "tb4":
+            plotting.plot_run_tb_comparison_4panel(
+                when, SCHEMES[Path(key).name], key,
+                hrrr_base_dir=opts.hrrr_dir, goes_dir=opts.goes_dir,
+                domain=opts.domain, out_file=out_path,
+                auto_download_goes=opts.auto_download,
+                wrf_tb_kwargs={"cache_dir": opts.cache_dir, "require_cache": True},
+            )
+        elif ptype == "refl3":
+            plotting.plot_run_refl_comparison(
+                when, SCHEMES[Path(key).name], key,
+                hrrr_base_dir=opts.hrrr_dir, mrms_dir=opts.mrms_dir,
+                domain=opts.domain, out_file=out_path,
+                auto_download_mrms=opts.auto_download,
+            )
+        elif ptype == "wrf_tb":
+            plotting.plot_run_wrf_tb_single(
+                when, SCHEMES[Path(key).name], key, domain=opts.domain,
+                out_file=out_path,
+                wrf_tb_kwargs={"cache_dir": opts.cache_dir, "require_cache": True},
+            )
+        elif ptype == "wrf_refl":
+            plotting.plot_run_wrf_refl_single(
+                when, SCHEMES[Path(key).name], key, domain=opts.domain,
+                out_file=out_path,
+            )
+        elif ptype == "hrrr_tb":
+            plotting.plot_case_hrrr_tb_single(
+                when, key, runs_root / key / REF_SCHEME,
+                hrrr_base_dir=opts.hrrr_dir, domain=opts.domain, out_file=out_path,
+            )
+        elif ptype == "hrrr_refl":
+            plotting.plot_case_hrrr_refl_single(
+                when, key, runs_root / key / REF_SCHEME,
+                hrrr_base_dir=opts.hrrr_dir, domain=opts.domain, out_file=out_path,
+            )
+        elif ptype == "goes_tb":
+            plotting.plot_case_goes_tb_single(
+                when, key, runs_root / key / REF_SCHEME,
+                goes_dir=opts.goes_dir, domain=opts.domain, out_file=out_path,
+                auto_download_goes=opts.auto_download,
+            )
+        elif ptype == "mrms_refl":
+            plotting.plot_case_mrms_refl_single(
+                when, key, runs_root / key / REF_SCHEME,
+                mrms_dir=opts.mrms_dir, domain=opts.domain, out_file=out_path,
+                auto_download_mrms=opts.auto_download,
+            )
+        else:  # pragma: no cover - guarded by _resolve_types
+            raise ValueError(f"unknown plot type {ptype!r}")
+    finally:
+        plt.close("all")
+
+
+def run(worklist: list[tuple], opts: argparse.Namespace, log=print) -> dict:
+    summary = {"ok": 0, "skipped": 0, "failed": 0, "failures": [], "seconds": 0.0}
+    t_start = time.time()
+    total = len(worklist)
+
+    for i, item in enumerate(worklist, 1):
+        ptype, key, when, out_path = item
+        tag = f"{ptype} {Path(key).name if isinstance(key, Path) else key} {when:%Y-%m-%d_%H:%M}"
+        out_path = Path(out_path)
+        if out_path.exists() and not opts.overwrite:
+            summary["skipped"] += 1
+            log(f"[{i}/{total}] SKIP  {tag}")
+            continue
+
+        for attempt in range(opts.retry + 1):
+            t0 = time.time()
+            try:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                _render(item, opts)
+                summary["ok"] += 1
+                log(f"[{i}/{total}] OK    {tag}  {time.time() - t0:.1f}s  -> {out_path.name}")
+                break
+            except Exception as exc:  # noqa: BLE001 - one bad frame must not abort the batch
+                if attempt < opts.retry:
+                    log(f"[{i}/{total}] RETRY {tag}  attempt {attempt + 1}: {exc!r}")
+                    continue
+                summary["failed"] += 1
+                summary["failures"].append(f"{tag}: {exc!r}")
+                log(f"[{i}/{total}] FAIL  {tag}  after {attempt + 1} attempt(s): {exc!r}")
+
+    summary["seconds"] = time.time() - t_start
+    return summary
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="python -m bnf_wrf_eval.batch_plot",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--which", default="all",
+                   help="comparison | single | all | comma-separated type names")
+    p.add_argument("--runs-root", default=DEFAULT_RUNS_ROOT)
+    p.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT)
+    p.add_argument("--domain", default=DEFAULT_DOMAIN)
+    p.add_argument("--hrrr-dir", default=DEFAULT_HRRR_DIR)
+    p.add_argument("--goes-dir", default=DEFAULT_GOES_DIR)
+    p.add_argument("--mrms-dir", default=DEFAULT_MRMS_DIR)
+    p.add_argument("--cache-dir", default=DEFAULT_CACHE_DIR)
+    p.add_argument("--start", type=dt.datetime.fromisoformat, default=None)
+    p.add_argument("--end", type=dt.datetime.fromisoformat, default=None)
+    p.add_argument("--auto-download", action="store_true",
+                   help="fetch missing GOES/MRMS files inline (races under a job array)")
+    p.add_argument("--overwrite", action="store_true",
+                   help="re-render frames that already exist on disk")
+    p.add_argument("--retry", type=int, default=1,
+                   help="extra attempts per frame on an exception")
+    p.add_argument("--task-index", type=int, default=None)
+    p.add_argument("--task-count", type=int, default=None)
+    p.add_argument("--limit", type=int, default=None,
+                   help="render at most this many frames (after task slicing)")
+    p.add_argument("--list", action="store_true",
+                   help="print the resolved work list and exit")
+    return p
+
+
+def _resolve_task_slice(args: argparse.Namespace) -> tuple[int | None, int | None]:
+    idx, cnt = args.task_index, args.task_count
+    if idx is None and "SLURM_ARRAY_TASK_ID" in os.environ:
+        idx = int(os.environ["SLURM_ARRAY_TASK_ID"])
+    if cnt is None and "SLURM_ARRAY_TASK_COUNT" in os.environ:
+        cnt = int(os.environ["SLURM_ARRAY_TASK_COUNT"])
+    if (idx is None) != (cnt is None):
+        raise SystemExit("task-index and task-count must be given together")
+    return idx, cnt
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    types = _resolve_types(args.which)
+
+    worklist = build_worklist(
+        types,
+        runs_root=args.runs_root,
+        output_root=args.output_root,
+        domain=args.domain,
+        start=args.start,
+        end=args.end,
+    )
+    idx, cnt = _resolve_task_slice(args)
+    scope = ""
+    if idx is not None:
+        worklist = worklist[idx::cnt]
+        scope = f" (task {idx}/{cnt})"
+    if args.limit is not None:
+        worklist = worklist[: args.limit]
+        scope += f" (limit {args.limit})"
+
+    if args.list:
+        for j, (ptype, key, when, out_path) in enumerate(worklist):
+            name = Path(key).name if isinstance(key, Path) else key
+            print(f"{j:5d}  {ptype:10s}  {name:24s}  {when:%Y-%m-%d_%H:%M}  {out_path}")
+        print(f"# {len(worklist)} frame(s){scope}  types={','.join(types)}")
+        return 0
+
+    print(
+        f"batch_plot: {len(worklist)} frame(s){scope}  types={','.join(types)}  "
+        f"output_root={args.output_root}  auto_download={args.auto_download}",
+        flush=True,
+    )
+    summary = run(worklist, args)
+    print(
+        f"batch_plot done{scope}: ok={summary['ok']} skipped={summary['skipped']} "
+        f"failed={summary['failed']}  {summary['seconds'] / 60:.1f} min",
+        flush=True,
+    )
+    for failure in summary["failures"]:
+        print(f"  FAILED: {failure}", flush=True)
+    return 1 if summary["failed"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
