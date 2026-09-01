@@ -111,6 +111,53 @@ def read_cloud_top_temperature(
     return lon, lat, values, valid_time
 
 
+def brightness_temperature_from_olr(olr: np.ndarray) -> np.ndarray:
+    """IR-window brightness temperature (K) from broadband TOA OLR (W/m^2).
+
+    Uses the widely-used empirical fit
+
+        OLR = sigma * Tf**4,   Tf = Tb * (a + b*Tb)
+
+    with a = 1.228, b = -1.106e-3 K^-1 and sigma the Stefan-Boltzmann
+    constant, inverted for Tb by solving the quadratic
+    ``b*Tb**2 + a*Tb - Tf = 0``. The relation is from Yang and Slingo
+    (2001, MWR 129, 784-801; coefficients originally Ohring et al. 1984)
+    and is the same conversion PyFLEXTRKR applies in
+    ``ftfunctions.olr_to_tb``.
+
+    This is a cheap, no-forward-model alternative to CRTM-derived Tb
+    (`bnf_wrf_eval.crtm.read_simulated_brightness_temperature`) and to the
+    `ctt` diagnostic (`read_cloud_top_temperature`). Because OLR is a
+    broadband flux integrated over the whole column rather than a narrow
+    window-channel radiance, the result is an "effective" temperature that
+    runs warm relative to a clean IR window (e.g. GOES ABI channel 13) and
+    smooths out the very coldest convective cloud tops -- but it needs only
+    a field already present in every wrfout / HRRR file.
+    """
+    sigma = 5.67e-8  # Stefan-Boltzmann constant, W m^-2 K^-4
+    a = 1.228
+    b = -1.106e-3  # K^-1
+    tf = (np.asarray(olr, dtype=float) / sigma) ** 0.25
+    return (-a + np.sqrt(a**2 + 4 * b * tf)) / (2 * b)
+
+
+def read_brightness_temperature_from_olr(
+    wrf_file: str | Path, varname: str = "OLR"
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
+    """IR-window brightness temperature (K), converted from WRF's TOA OLR.
+
+    Reads wrfout's `OLR` (top-of-atmosphere outgoing long-wave radiation,
+    W/m^2) and passes it through `brightness_temperature_from_olr` -- see
+    that function for the formula, its provenance, and the caveats about
+    how a broadband-flux effective temperature differs from a true
+    narrow-channel Tb. Provided as a fast counterpart to
+    `read_cloud_top_temperature` and the CRTM path, comparable to HRRR's
+    `hrrr.read_brightness_temperature_from_olr`.
+    """
+    lon, lat, olr, valid_time = read_field(wrf_file, varname)
+    return lon, lat, brightness_temperature_from_olr(olr), valid_time
+
+
 def read_column_max_reflectivity(
     wrf_file: str | Path, varname: str = "REFL_10CM"
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:

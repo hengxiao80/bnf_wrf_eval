@@ -621,25 +621,46 @@ def plot_tb_comparison_4panel(
     out_file: str | Path | None = None,
     wrf_tb_stride: int = 1,
     wrf_tb_kwargs: dict | None = None,
+    wrf_panel: str = "ctt",
 ):
-    """Like `plot_tb_comparison`, but with an extra panel showing WRF's
-    older `wrf.read_cloud_top_temperature` (`ctt`) diagnostic alongside the
-    newer CRTM-derived WRF panel, for a direct side-by-side look at how the
-    two WRF-side methods compare -- laid out as a 2x2 grid: WRF `ctt` | WRF
+    """Like `plot_tb_comparison`, but with a second WRF-side panel next to
+    the CRTM-derived one, laid out as a 2x2 grid: <extra WRF panel> | WRF
     simulated Tb (CRTM) on top, HRRR simulated Tb | GOES observed Tb below.
+
+    `wrf_panel` selects what the extra top-left panel shows:
+
+    - ``"ctt"`` (default): WRF's `wrf.read_cloud_top_temperature` (`ctt`)
+      diagnostic -- WRF's own purpose-built optical-depth cloud-top
+      temperature.
+    - ``"olr"``: WRF's quick OLR-derived brightness temperature
+      (`wrf.read_brightness_temperature_from_olr`) -- a one-line algebraic
+      conversion of the broadband TOA `OLR` field, the cheap
+      no-forward-model alternative.
+
+    Either way the panel is a direct side-by-side look at how that simpler
+    WRF-side method compares with the full CRTM forward model.
 
     See `plot_tb_comparison` for the rationale behind the CRTM-based panels
     and for what all the other parameters do; `wrf_tb_stride`/
-    `wrf_tb_kwargs` apply only to the CRTM panel (the `ctt` panel always
-    runs at WRF's native resolution -- it's a lightweight wrf-python
-    diagnostic, not a per-column CRTM forward-model call, so it doesn't
-    need the same memory-driven subsampling).
+    `wrf_tb_kwargs` apply only to the CRTM panel (the extra panel always
+    runs at WRF's native resolution -- both `ctt` and the OLR fit are
+    lightweight, not per-column CRTM forward-model calls, so neither needs
+    the same memory-driven subsampling).
 
     Returns
     -------
     matplotlib.figure.Figure
     """
-    ctt_lon, ctt_lat, wrf_ctt, _ = wrf_reader.read_cloud_top_temperature(wrf_file)
+    if wrf_panel == "ctt":
+        wrf_x_lon, wrf_x_lat, wrf_x_val, _ = wrf_reader.read_cloud_top_temperature(wrf_file)
+        wrf_x_title = "WRF cloud-top temperature (ctt) (K)"
+    elif wrf_panel == "olr":
+        wrf_x_lon, wrf_x_lat, wrf_x_val, _ = wrf_reader.read_brightness_temperature_from_olr(
+            wrf_file
+        )
+        wrf_x_title = "WRF simple brightness temp. (OLR fit) (K)"
+    else:
+        raise ValueError(f"wrf_panel must be 'ctt' or 'olr', got {wrf_panel!r}")
     proj = wrf_reader.get_lambert_projection(wrf_file)
 
     wrf_lon, wrf_lat, wrf_tb, wrf_time = crtm_reader.read_simulated_brightness_temperature(
@@ -650,10 +671,10 @@ def plot_tb_comparison_4panel(
     )
     goes_lon, goes_lat, goes_tb, goes_time = goes_reader.read_brightness_temperature(goes_file)
 
-    extent = _domain_extent(ctt_lon, ctt_lat, domain_pad_deg)
+    extent = _domain_extent(wrf_x_lon, wrf_x_lat, domain_pad_deg)
     hrrr_lon_c, hrrr_lat_c, hrrr_tb_c = _crop_to_extent(hrrr_lon, hrrr_lat, hrrr_tb, extent)
     goes_lon_c, goes_lat_c, goes_tb_c = _crop_to_extent(goes_lon, goes_lat, goes_tb, extent)
-    domain_outline = _domain_outline(ctt_lon, ctt_lat)
+    domain_outline = _domain_outline(wrf_x_lon, wrf_x_lat)
 
     fig, axes = plt.subplots(
         2, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
@@ -663,7 +684,7 @@ def plot_tb_comparison_4panel(
     _plot_row(
         fig, axes.flatten(),
         [
-            (ctt_lon, ctt_lat, wrf_ctt, "WRF cloud-top temperature (ctt) (K)"),
+            (wrf_x_lon, wrf_x_lat, wrf_x_val, wrf_x_title),
             (wrf_lon, wrf_lat, wrf_tb, "WRF simulated brightness temp. (CRTM) (K)"),
             (hrrr_lon_c, hrrr_lat_c, hrrr_tb_c, "HRRR simulated brightness temp. (K)"),
             (
@@ -694,14 +715,19 @@ def plot_run_tb_comparison_4panel(
     domain: str = "d01",
     output_base_dir: str | Path | None = None,
     auto_download_goes: bool = False,
+    wrf_panel: str = "ctt",
     **kwargs,
 ):
     """Wrapper around `plot_tb_comparison_4panel`, otherwise identical to
-    `plot_run_tb_comparison` -- see there for what every parameter does.
+    `plot_run_tb_comparison` -- see there for what every parameter does, and
+    `plot_tb_comparison_4panel` for what `wrf_panel` (`"ctt"` | `"olr"`)
+    selects for the extra top-left panel.
+
     Saved output filenames use the `wrf_ctt_crtm_hrrr_goes_tb_comparison`
-    prefix (vs. `plot_run_tb_comparison`'s `wrf_hrrr_goes_tb_comparison`)
-    so the two don't overwrite each other when both are run for the same
-    run/time.
+    prefix for `wrf_panel="ctt"` and `wrf_simple_tb_crtm_hrrr_goes_tb_comparison`
+    for `wrf_panel="olr"` (vs. `plot_run_tb_comparison`'s
+    `wrf_hrrr_goes_tb_comparison`), so the three don't overwrite each other
+    when run for the same run/time.
 
     **kwargs : forwarded to `plot_tb_comparison_4panel` (e.g. `ctt_levels`,
         `out_file`, `wrf_tb_stride`, `wrf_tb_kwargs`).
@@ -719,13 +745,17 @@ def plot_run_tb_comparison_4panel(
 
     goes_file = _resolve_goes_file(time, goes_dir, channel, satellite, auto_download_goes)
 
+    _prefix = {
+        "ctt": "wrf_ctt_crtm_hrrr_goes_tb_comparison",
+        "olr": "wrf_simple_tb_crtm_hrrr_goes_tb_comparison",
+    }[wrf_panel]
     if output_base_dir is not None and "out_file" not in kwargs:
-        kwargs["out_file"] = _output_path(
-            output_base_dir, "wrf_ctt_crtm_hrrr_goes_tb_comparison", run_dir, time
-        )
+        kwargs["out_file"] = _output_path(output_base_dir, _prefix, run_dir, time)
 
     suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
-    return plot_tb_comparison_4panel(wrf_file, hrrr_file, goes_file, suptitle=suptitle, **kwargs)
+    return plot_tb_comparison_4panel(
+        wrf_file, hrrr_file, goes_file, suptitle=suptitle, wrf_panel=wrf_panel, **kwargs
+    )
 
 
 # ---------------------------------------------------------------------------

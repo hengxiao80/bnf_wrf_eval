@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from ._eccodes_setup import ensure_eccodes_loadable
+from .wrf import brightness_temperature_from_olr
 
 
 def _get_eccodes():
@@ -104,6 +105,22 @@ def read_olr(grib_file: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray,
     return read_field(
         grib_file, type_of_level="nominalTop", parameter_category=5, parameter_number=4
     )
+
+
+def read_brightness_temperature_from_olr(
+    grib_file: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
+    """IR-window brightness temperature (K), converted from HRRR's TOA OLR.
+
+    Reads HRRR's top-of-atmosphere upward long-wave flux (`read_olr`) and
+    passes it through `wrf.brightness_temperature_from_olr` -- see that
+    function for the formula and caveats. This is the cheap,
+    same-recipe-as-WRF counterpart to `read_simulated_brightness_temperature`
+    (HRRR's own CRTM `SBT114`), so a WRF-vs-HRRR OLR-derived Tb comparison
+    stays apples-to-apples.
+    """
+    lon, lat, olr, valid_time = read_olr(grib_file)
+    return lon, lat, brightness_temperature_from_olr(olr), valid_time
 
 
 def read_simulated_brightness_temperature(

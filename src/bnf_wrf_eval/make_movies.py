@@ -9,7 +9,7 @@ group by that timestamp, and encodes it to
     python -m bnf_wrf_eval.make_movies --which comparison
     python -m bnf_wrf_eval.make_movies --which single --fps 12
 
-`--which` takes `comparison` (tb4, refl3), `single` (the six single-panel
+`--which` takes `comparison` (tb4, tb4_simple, refl3), `single` (the six single-panel
 types), `all`, or a comma-separated list of type names. `--task-index` /
 `--task-count` (or the SLURM job-array env vars) slice the movie list
 `movies[idx::cnt]`. An existing MP4 is skipped unless `--overwrite`.
@@ -36,7 +36,7 @@ DEFAULT_MOVIES_DIR = "outputs/movies"
 DEFAULT_FPS = 12
 
 GROUPS = {
-    "comparison": ["tb4", "refl3"],
+    "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
 }
 GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"]

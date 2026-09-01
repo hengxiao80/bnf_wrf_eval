@@ -39,8 +39,11 @@ marked with a red star on every panel:
   observed brightness temperature -- this is now a genuine apples-to-apples comparison (same forward model, same
   channel) rather than relying on WRF's simpler `ctt` diagnostic (`wrf.read_cloud_top_temperature`, still
   available and still WRF's own purpose-built approximation of the same quantity via `wrf-python`). The 4-panel
-  layout additionally shows `ctt` alongside the CRTM panel, for a direct look at how the two WRF-side methods
-  compare; the notebooks under `notebooks/` currently use this 4-panel version. Both Tb layouts share a custom
+  layout additionally shows a second WRF-side method alongside the CRTM panel, for a direct look at how it
+  compares -- `wrf_panel="ctt"` (default) uses `ctt`; `wrf_panel="olr"` uses WRF's quick OLR-derived Tb
+  (`wrf.read_brightness_temperature_from_olr`, the Yang & Slingo 2001 broadband `OLR = sigma*Tf**4` fit, also
+  exposed for HRRR as `hrrr.read_brightness_temperature_from_olr`). The notebooks under `notebooks/` currently
+  use the `ctt` 4-panel version. Both Tb layouts share a custom
   colormap (`plotting.DEFAULT_TB_CMAP`) matching the conventional grayscale-above/rainbow-below IR enhancement
   (black-to-white for 240-315 K, then a cyan-to-magenta rainbow for the coldest convective cloud tops down to
   180 K) rather than a plain grayscale.
@@ -240,7 +243,7 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   - `batch_plot.py` -- frame-render driver for the "plots and movies" batch (see the "Plots and movies" note
     below). Enumerates a deterministic `(plot_type, run|case, time)` work list, slices it `[idx::count]` for a
     SLURM job array (strided), skips frames already on disk (restartable), retries per-frame exceptions. Renders
-    both the hourly comparison frames (`tb4`, `refl3`) and the six single-panel series (`wrf_tb`, `wrf_refl`,
+    both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`) and the six single-panel series (`wrf_tb`, `wrf_refl`,
     `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`) into `<output-root>/frames/<type>/`. Run as
     `python -m bnf_wrf_eval.batch_plot --which comparison|single|all|<types>`; `scripts/batch_plot.sbatch` is the
     64-task array. **The observation files must be local already** (`scripts/download_obs.py`): `batch_plot`
@@ -334,14 +337,18 @@ bullets under "Structure". Task prompt: `prompts/plots_and_movies.md`.
 Two families:
 
 - **Hourly comparison** (HRRR analyses are hourly, so these use on-the-hour WRF/GOES/MRMS): `tb4` = the 2x2
-  `plot_run_tb_comparison_4panel` (WRF `ctt` | WRF CRTM | HRRR | GOES) and `refl3` = the 3-panel
-  `plot_run_refl_comparison` (WRF | HRRR | MRMS), 73 frames/run each -> 9 movies each (18 total).
+  `plot_run_tb_comparison_4panel` (WRF `ctt` | WRF CRTM | HRRR | GOES); `tb4_simple` = the same 2x2 but with the
+  top-left panel replaced by WRF's quick OLR-derived Tb (`wrf.read_brightness_temperature_from_olr` -- the
+  Yang & Slingo 2001 `OLR = sigma*Tf**4` fit, same conversion as PyFLEXTRKR's `ftfunctions.olr_to_tb`),
+  selected via `plot_run_tb_comparison_4panel(..., wrf_panel="olr")` and written under the
+  `wrf_simple_tb_crtm_hrrr_goes_tb_comparison` prefix so it never overwrites the `ctt` `tb4` frames; `refl3` =
+  the 3-panel `plot_run_refl_comparison` (WRF | HRRR | MRMS). 73 frames/run each -> 9 movies each (27 total).
 - **Single-panel**, one field per frame at its native cadence: `wrf_tb` (WRF CRTM Tb) and `wrf_refl` (WRF
   column-max reflectivity) at 15 min per run (289 frames -> 9 movies each); `hrrr_tb` / `hrrr_refl` hourly per
   case (73 frames -> 3 movies each); `goes_tb` at GOES CONUS 5 min per case (~865 frames -> 3 movies);
   `mrms_refl` at 15 min per case (289 frames -> 3 movies). 30 single-panel movies.
 
-48 movies total, H.264 12 fps, in `outputs/movies/<frame-prefix>.mp4`; frames in `outputs/frames/<type>/`.
+57 movies total, H.264 12 fps, in `outputs/movies/<frame-prefix>.mp4`; frames in `outputs/frames/<type>/`.
 
 Regenerate (from a login node -- the download step needs internet, see the compute-node note under `plotting.py`):
 
@@ -351,7 +358,10 @@ Regenerate (from a login node -- the download step needs internet, see the compu
     python -m bnf_wrf_eval.make_movies --which all
 
 The one-time full run (2026-08-30): 10,416 frames, 0 failures; comparison array job 1023630 (~19 min), WRF/HRRR
-single-panel array 1023698, GOES/MRMS single-panel array 1023731. Single-panel plots deliberately have **no
+single-panel array 1023698, GOES/MRMS single-panel array 1023731. The `tb4_simple` series was added later
+(2026-09-01, `WHICH=tb4_simple` array job 1023849, 657 frames, 0 failures, ~3 min -- the OLR-fit panel is a
+one-line array op so these render faster than `tb4`, whose `ctt` diagnostic dominates) followed by its 9
+movies. Single-panel plots deliberately have **no
 per-panel title**, a suptitle carrying the field's *actual* valid/scan time, a colorbar drawn to the exact
 height of the (aspect-shrunk) map, and colorbar labels `Brightness Temp. (K)` / `Comp. Refl (dBZ)`; the GOES
 suptitle reads `GOES-<n> (#<channel>)`.

@@ -4,8 +4,10 @@ Separates plotting (many independent, ~1-3 s cartopy renders) from movie
 assembly (`bnf_wrf_eval.make_movies`), the same way `crtm_precompute` split
 the CRTM forward model from plotting. Run this to render every frame of
 
-  * the hourly 4-panel Tb comparison (WRF ctt | WRF CRTM | HRRR | GOES) and
-    3-panel reflectivity comparison (WRF | HRRR | MRMS), per run; and
+  * the hourly 4-panel Tb comparison, per run, in two variants -- `tb4`
+    (WRF ctt | WRF CRTM | HRRR | GOES) and `tb4_simple` (WRF OLR-fit Tb |
+    WRF CRTM | HRRR | GOES) -- and the 3-panel reflectivity comparison
+    (WRF | HRRR | MRMS), per run; and
   * the six single-panel series -- WRF CRTM Tb, WRF reflectivity (both
     15-min, per run), HRRR Tb, HRRR reflectivity (both hourly, per case),
     GOES Tb (5-min, per case), MRMS reflectivity (15-min, per case).
@@ -16,8 +18,8 @@ Runs as a module (like `crtm_precompute`, deliberately no console-script):
     python -m bnf_wrf_eval.batch_plot --which single --output-root outputs
 
 `--which` takes `comparison`, `single`, `all`, or any comma-separated list
-of the individual type names (`tb4`, `refl3`, `wrf_tb`, `wrf_refl`,
-`hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`).
+of the individual type names (`tb4`, `tb4_simple`, `refl3`, `wrf_tb`,
+`wrf_refl`, `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`).
 
 The flat work list is deterministically ordered, so `--task-index` /
 `--task-count` (or the `SLURM_ARRAY_TASK_ID` / `SLURM_ARRAY_TASK_COUNT` a
@@ -73,6 +75,7 @@ REF_SCHEME = "rund1"  # subdir used for the (time-independent) domain geometry
 # iterates every case x scheme; scope "case" iterates case days only.
 TYPES: dict[str, tuple[str, int, str]] = {
     "tb4": ("run", 60, "wrf_ctt_crtm_hrrr_goes_tb_comparison"),
+    "tb4_simple": ("run", 60, "wrf_simple_tb_crtm_hrrr_goes_tb_comparison"),
     "refl3": ("run", 60, "wrf_hrrr_mrms_refl_comparison"),
     "wrf_tb": ("run", 15, "wrf_crtm_tb"),
     "wrf_refl": ("run", 15, "wrf_refl"),
@@ -82,7 +85,7 @@ TYPES: dict[str, tuple[str, int, str]] = {
     "mrms_refl": ("case", 15, "mrms_refl"),
 }
 GROUPS = {
-    "comparison": ["tb4", "refl3"],
+    "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
     "all": list(TYPES),
 }
@@ -200,12 +203,13 @@ def _render(item: tuple, opts: argparse.Namespace) -> None:
     ptype, key, when, out_path = item
     runs_root = Path(opts.runs_root)
     try:
-        if ptype == "tb4":
+        if ptype in ("tb4", "tb4_simple"):
             plotting.plot_run_tb_comparison_4panel(
                 when, SCHEMES[Path(key).name], key,
                 hrrr_base_dir=opts.hrrr_dir, goes_dir=opts.goes_dir,
                 domain=opts.domain, out_file=out_path,
                 auto_download_goes=opts.auto_download,
+                wrf_panel="olr" if ptype == "tb4_simple" else "ctt",
                 wrf_tb_kwargs={"cache_dir": opts.cache_dir, "require_cache": True},
             )
         elif ptype == "refl3":

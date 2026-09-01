@@ -4,7 +4,7 @@ Animated comparisons of the WRF LASSO BNF test runs (Satoshi's `hrrr3` d1 (2.5-k
 analyses that drove them and against independent satellite / radar observations,
 for the DOE ARM Bankhead National Forest (BNF) site in northern Alabama.
 
-All 48 movies are H.264 (`yuv420p`), **12 fps, no audio**. At 12 fps an hourly
+All 57 movies are H.264 (`yuv420p`), **12 fps, no audio**. At 12 fps an hourly
 (73-frame) movie runs ~6 s, a 15-min (289-frame) movie ~24 s, and the 5-min GOES
 movies (~865 frames) ~72 s.
 
@@ -45,6 +45,12 @@ Each case was run with three microphysics schemes (everything else identical):
   same channel).
 - **WRF `ctt`**: WRF's simpler built-in cloud-top-temperature diagnostic
   (`wrf-python`), shown alongside the CRTM panel for reference.
+- **WRF simple Tb (OLR fit)**: brightness temperature obtained by inverting the
+  broadband Yang & Slingo (2001) `OLR = σ·Tf⁴`, `Tf = Tb·(a + b·Tb)` relation on
+  WRF's top-of-atmosphere `OLR` field (the same conversion PyFLEXTRKR uses). No
+  forward model — a cheap alternative to the CRTM panel. Being a column-integrated
+  flux it runs slightly warm relative to a true window channel and smooths out the
+  coldest convective cloud tops.
 - **WRF reflectivity**: column maximum of the simulated `REFL_10CM` field (dBZ),
   directly comparable to the HRRR and MRMS composite reflectivity.
 
@@ -62,14 +68,15 @@ across all frames so the animations do not flicker:
 
 ## Movie inventory
 
-### Comparison movies (hourly, 73 frames each) — 18 files
+### Comparison movies (hourly, 73 frames each) — 27 files
 
 | File pattern | Layout |
 |--------------|--------|
 | `wrf_ctt_crtm_hrrr_goes_tb_comparison_<case>_<run>.mp4` | 2×2 brightness temperature: WRF `ctt` \| WRF CRTM \| HRRR CRTM \| GOES observed |
+| `wrf_simple_tb_crtm_hrrr_goes_tb_comparison_<case>_<run>.mp4` | 2×2 brightness temperature, as above but with the top-left panel replaced by **WRF simple Tb (OLR fit)** |
 | `wrf_hrrr_mrms_refl_comparison_<case>_<run>.mp4` | 3-panel reflectivity: WRF \| HRRR \| MRMS |
 
-9 of each (3 cases × 3 runs).
+9 of each of the three (3 cases × 3 runs).
 
 ### Single-panel movies — 30 files
 
