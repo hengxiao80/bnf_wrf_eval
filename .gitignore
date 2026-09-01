@@ -9,8 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated plots/output
-outputs/
+# Generated plots/output (but keep the hand-written movie catalogue for the record)
+outputs/*
+!outputs/movies/
+outputs/movies/*
+!outputs/movies/README.md
 
 # Downloaded satellite/radar observation data
 goes_data/
