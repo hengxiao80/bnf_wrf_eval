@@ -14,10 +14,32 @@ from matplotlib.colors import Colormap, LinearSegmentedColormap
 from . import crtm as crtm_reader
 from . import goes as goes_reader
 from . import hrrr as hrrr_reader
+from . import lightning as lightning_reader
 from . import mrms as mrms_reader
+from . import nalma as nalma_reader
 from . import wrf as wrf_reader
 
 DEFAULT_REFL_LEVELS = np.arange(5, 76, 5)
+# Flash counts are sparse, non-negative integers (mostly 0), not a smooth
+# field -- geometric-ish spacing so both a quiet cell (1-2 flashes) and an
+# active storm core (dozens) get distinguishable colors.
+DEFAULT_LIGHTNING_COUNT_LEVELS = np.array([1, 2, 3, 5, 10, 20, 50, 100])
+# CG-only counts (`DEFAULT_LIGHTNING_COUNT_LEVELS`) never actually reach
+# 100 in practice, but total lightning (CG + intracloud) does -- checked
+# against a real active-storm hour: WRF's true max there was 280 with the
+# 99.9th percentile of nonzero cells already at 148, so capping at 100
+# would flatten the most-intense storm-core cells (exactly the ones worth
+# distinguishing) into one "off-scale" bucket. One extra level pushes that
+# ceiling out to 200.
+DEFAULT_LIGHTNING_TOTAL_COUNT_LEVELS = np.array([1, 2, 3, 5, 10, 20, 50, 100, 200])
+# NALMA's raw VHF *sources* (not flash-clustered -- see `nalma.py`'s module
+# docstring) are a completely different scale from flash counts: checked
+# against a real active-storm hour, ~3 million sources domain-wide vs.
+# WRF's 58,441 flashes over the same window (~51 sources/flash, consistent
+# with LMA literature), with a single WRF grid cell reaching 9540 sources.
+# A wide geometric spread is needed to show both quiet fringes and the
+# most active storm cores.
+DEFAULT_LIGHTNING_SOURCE_COUNT_LEVELS = np.array([10, 30, 100, 300, 1000, 3000, 10000])
 # 180-315 K to match the enhancement curve below: grayscale above the 240K
 # convective-cloud-top threshold, a rainbow enhancement below it.
 DEFAULT_CTT_LEVELS = np.arange(180, 316, 5)
@@ -179,18 +201,49 @@ def _plot_panel(
     extend: str = "both",
     domain_outline: tuple[np.ndarray, np.ndarray] | None = None,
     site: tuple[float, float] | None = (BNF_SITE_LON, BNF_SITE_LAT),
+    plot_type: str = "contourf",
+    dark_background: bool = False,
 ):
+    fg_color = "white" if dark_background else "black"
     ax.set_extent(extent, crs=ccrs.PlateCarree())
-    # Pre-project lon/lat to the axes' own X/Y and call contourf with no
-    # `transform=` kwarg, rather than letting cartopy do it: cartopy's
-    # contourf reprojection drops cells (leaves visible holes) for a
-    # curvilinear grid that's rotated relative to the axes projection --
-    # e.g. HRRR's own Lambert grid plotted on WRF's Lambert axes -- even
+    if dark_background:
+        ax.set_facecolor("black")
+    # Pre-project lon/lat to the axes' own X/Y and call contourf/pcolormesh
+    # with no `transform=` kwarg, rather than letting cartopy do it:
+    # cartopy's contourf reprojection drops cells (leaves visible holes)
+    # for a curvilinear grid that's rotated relative to the axes projection
+    # -- e.g. HRRR's own Lambert grid plotted on WRF's Lambert axes -- even
     # though the same grid renders fine with pcolormesh.
     xyz = ax.projection.transform_points(ccrs.PlateCarree(), lon, lat)
     x, y = xyz[..., 0], xyz[..., 1]
-    mesh = ax.contourf(x, y, values, levels=levels, cmap=cmap, extend=extend)
-    ax.coastlines(resolution="50m", linewidth=0.8)
+    if plot_type == "contourf":
+        mesh = ax.contourf(x, y, values, levels=levels, cmap=cmap, extend=extend)
+    elif plot_type == "pcolormesh":
+        # For sparse, mostly-NaN data (e.g. per-cell lightning flash
+        # counts), `contourf` is the wrong tool: it fills the area *between*
+        # grid points above a level, so an isolated non-zero cell entirely
+        # surrounded by NaN neighbors has no contiguous region to fill and
+        # renders as nothing -- real data silently vanishing, not a display
+        # quirk. `pcolormesh` colors each cell on its own regardless of its
+        # neighbors, which is what sparse per-cell data needs.
+        from matplotlib.colors import BoundaryNorm
+
+        # `.copy()` before `set_over`: `plt.get_cmap` returns matplotlib's
+        # shared registered instance, so mutating it in place would leak
+        # into every other plot using this same cmap name.
+        cmap_obj = (plt.get_cmap(cmap) if isinstance(cmap, str) else cmap).copy()
+        if dark_background and extend in ("max", "both"):
+            # On a black background, the top of most sequential colormaps
+            # (e.g. YlOrRd's dark red) is a genuinely dark color -- exactly
+            # where the actual maxima land -- so it doesn't stand out
+            # against black the way the low end does. Force the
+            # off-the-top-of-the-scale bin to pure white instead.
+            cmap_obj.set_over("white")
+        norm = BoundaryNorm(levels, cmap_obj.N, extend=extend)
+        mesh = ax.pcolormesh(x, y, values, cmap=cmap_obj, norm=norm, shading="nearest")
+    else:
+        raise ValueError(f"Unknown plot_type: {plot_type!r}")
+    ax.coastlines(resolution="50m", linewidth=0.8, color=fg_color)
     # Pin an explicit resolution on every feature (BORDERS defaults to
     # cartopy's AdaptiveScaler, which picks 110m/50m/10m based on each
     # plot's map extent). Left un-pinned, a domain with a different extent
@@ -199,14 +252,15 @@ def _plot_panel(
     # naturalearthdata.com mid-plot -- if that network call stalls, it
     # hangs the whole kernel in a way SIGINT can't reliably interrupt.
     # Pinning means every plot uses the same, already-cached files.
-    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.8)
-    ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.5, edgecolor="black")
+    ax.add_feature(cfeature.BORDERS.with_scale("50m"), linewidth=0.8, edgecolor=fg_color)
+    ax.add_feature(cfeature.STATES.with_scale("50m"), linewidth=0.5, edgecolor=fg_color)
     # Explicit dict form (rather than the top_labels/right_labels booleans)
     # so cartopy doesn't fall back to its per-label nearest-edge geometry
     # guess, which for a Lambert projection can misplace some longitude
     # labels on the side panels.
     gl = ax.gridlines(
-        draw_labels={"bottom": "x", "left": "y"}, linestyle="--", color="gray", alpha=0.5
+        draw_labels={"bottom": "x", "left": "y"}, linestyle="--",
+        color="white" if dark_background else "gray", alpha=0.5,
     )
     gl.x_inline = False
     gl.y_inline = False
@@ -216,6 +270,18 @@ def _plot_panel(
     # otherwise lands them inside the plot near the bottom edge.
     gl.rotate_labels = False
     gl.xpadding = 8
+    if dark_background:
+        gl.xlabel_style = {"color": "white"}
+        gl.ylabel_style = {"color": "white"}
+        # The axes' own frame/border (cartopy's "geo" spine) defaults to
+        # black -- invisible once both the figure and axes backgrounds are
+        # also black, making it impossible to tell where one panel ends
+        # and the next begins. Newer cartopy exposes it as a normal
+        # matplotlib spine; fall back to the older `outline_patch` API.
+        try:
+            ax.spines["geo"].set_edgecolor("white")
+        except (KeyError, AttributeError):
+            ax.outline_patch.set_edgecolor("white")
     if domain_outline is not None:
         outline_lon, outline_lat = domain_outline
         ax.plot(
@@ -227,9 +293,9 @@ def _plot_panel(
         ax.plot(
             site_lon, site_lat, transform=ccrs.PlateCarree(),
             marker="*", markersize=10, color="red",
-            markeredgecolor="black", markeredgewidth=0.5, linestyle="none", zorder=11,
+            markeredgecolor=fg_color, markeredgewidth=0.5, linestyle="none", zorder=11,
         )
-    ax.set_title(title, fontsize=10)
+    ax.set_title(title, fontsize=10, color=fg_color)
     return mesh
 
 
@@ -243,18 +309,28 @@ def _plot_row(
     domain_outline: tuple[np.ndarray, np.ndarray],
     extend: str,
     colorbar_label: str,
+    plot_type: str = "contourf",
+    dark_background: bool = False,
 ):
     """Draw one row of side-by-side comparison panels (e.g. WRF / HRRR /
     obs for the same variable, all on the same levels/cmap), sharing one
     colorbar. `panels` is a list of (lon, lat, values, title) tuples, one
-    per axes in `axes_row`."""
+    per axes in `axes_row`. `plot_type` picks the fill method -- see
+    `_plot_panel`; use `"pcolormesh"` for sparse, mostly-NaN data.
+    `dark_background` switches map features/labels/colorbar text to white,
+    for use with a black figure/axes background (set by the caller)."""
     mesh = None
     for ax, (lon, lat, values, title) in zip(axes_row, panels):
         mesh = _plot_panel(
             ax, lon, lat, values, levels, cmap, extent, title,
-            extend=extend, domain_outline=domain_outline,
+            extend=extend, domain_outline=domain_outline, plot_type=plot_type,
+            dark_background=dark_background,
         )
-    fig.colorbar(mesh, ax=axes_row[:], label=colorbar_label, shrink=0.5, pad=0.02)
+    cbar = fig.colorbar(mesh, ax=axes_row[:], label=colorbar_label, shrink=0.5, pad=0.02)
+    if dark_background:
+        cbar.set_label(colorbar_label, color="white")
+        cbar.ax.yaxis.set_tick_params(color="white")
+        plt.setp(plt.getp(cbar.ax, "yticklabels"), color="white")
 
 
 def plot_refl_comparison(
@@ -1375,3 +1451,423 @@ def plot_case_mrms_refl_single(
         colorbar_label="Comp. Refl (dBZ)",
         crop=True, suptitle=suptitle, out_file=out_file, **kwargs,
     )
+
+
+def plot_lightning_cg_comparison(
+    wrf_file_t1: str | Path,
+    wrf_file_t2: str | Path,
+    mrms_dir: str | Path,
+    auto_download_mrms: bool = True,
+    count_levels: np.ndarray = DEFAULT_LIGHTNING_COUNT_LEVELS,
+    cmap: str = "YlGn_r",
+    dark_background: bool = True,
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (11, 5.5),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Compare cloud-to-ground flash counts between WRF's Dynamic Lightning
+    Scheme and MRMS/NLDN observations, over the interval between two
+    consecutive wrfout times.
+
+    WRF panel: `cg_pos + cg_neg` from `wrf.read_dyn_lightning_flash_counts`
+    (the difference of `LPOS`/`LNEG` between `wrf_file_t1` and
+    `wrf_file_t2`), on the run's native grid.
+
+    MRMS panel: `lightning.mrms_cg_counts_on_wrf_grid` -- every ~1km NLDN
+    cell's value in `(t1, t2]`, binned and summed into the *same* WRF grid
+    cells, so both panels share one grid/projection/extent and are directly
+    differenceable, not just visually side-by-side.
+
+    Flash counts are sparse (mostly 0) and non-negative, unlike the smooth
+    dBZ/K fields the other comparison plots use, so cells with a count of
+    exactly 0 are left unfilled (masked to NaN before contouring) rather
+    than colored as the bottom `count_levels` bin, and `count_levels`
+    defaults to a small set of discrete count thresholds rather than an
+    evenly-spaced range.
+
+    This is a first-cut, not-yet-validated comparison -- see the caveat in
+    `mrms.read_nldn_cg_density` about the AvgDensity-to-count conversion,
+    and `prompts/lightning_evaluation.md` for the broader plan.
+
+    Parameters
+    ----------
+    wrf_file_t1, wrf_file_t2 : two consecutive wrfout_d0X_* files from a
+        `dyn_lightning_option=1` run (e.g. `rund1-dynlit`).
+    mrms_dir : local directory to look for/download NLDN files into.
+    suptitle : if given, drawn as a big figure-level title.
+    out_file : if given, the figure is saved there.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    wrf_lon, wrf_lat, cg_pos, cg_neg, _ic, (t1, t2) = wrf_reader.read_dyn_lightning_flash_counts(
+        wrf_file_t1, wrf_file_t2
+    )
+    wrf_cg = cg_pos + cg_neg
+    proj = wrf_reader.get_lambert_projection(wrf_file_t1)
+
+    mrms_lon, mrms_lat, mrms_cg, mrms_scan_times = lightning_reader.mrms_cg_counts_on_wrf_grid(
+        wrf_file_t1, t1, t2, mrms_dir, auto_download=auto_download_mrms
+    )
+
+    extent = _domain_extent(wrf_lon, wrf_lat, domain_pad_deg)
+    domain_outline = _domain_outline(wrf_lon, wrf_lat)
+
+    wrf_cg_masked = np.where(wrf_cg > 0, wrf_cg, np.nan)
+    mrms_cg_masked = np.where(mrms_cg > 0, mrms_cg, np.nan)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+    if dark_background:
+        fig.patch.set_facecolor("black")
+
+    n_scans = len(mrms_scan_times)
+    mrms_title = f"MRMS/NLDN\n({n_scans} 1-min scans summed)"
+    _plot_row(
+        fig, axes,
+        [
+            (wrf_lon, wrf_lat, wrf_cg_masked, "WRF"),
+            (mrms_lon, mrms_lat, mrms_cg_masked, mrms_title),
+        ],
+        count_levels, cmap, extent, domain_outline, extend="max",
+        colorbar_label="CG flashes per grid cell", plot_type="pcolormesh",
+        dark_background=dark_background,
+    )
+
+    if suptitle is not None:
+        fig.suptitle(
+            suptitle, fontsize=16, fontweight="bold", y=0.93,
+            color="white" if dark_background else "black",
+        )
+
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+
+    return fig
+
+
+def plot_lightning_total_comparison(
+    wrf_file_t1: str | Path,
+    wrf_file_t2: str | Path,
+    goes_dir: str | Path,
+    satellite: str = goes_reader.DEFAULT_SATELLITE,
+    auto_download_glm: bool = True,
+    count_levels: np.ndarray = DEFAULT_LIGHTNING_TOTAL_COUNT_LEVELS,
+    cmap: str = "YlGn_r",
+    dark_background: bool = True,
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (11, 5.5),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Compare total-lightning (CG + intracloud) flash counts between WRF's
+    Dynamic Lightning Scheme and GOES GLM observations, over the interval
+    between two consecutive wrfout times.
+
+    WRF panel: `cg_pos + cg_neg + ic` from
+    `wrf.read_dyn_lightning_flash_counts` (the difference of
+    `LPOS`/`LNEG`/`LNEU` between `wrf_file_t1` and `wrf_file_t2`), on the
+    run's native grid.
+
+    GLM panel: `lightning.glm_total_counts_on_wrf_grid` -- every flash
+    centroid from GLM-L2-LCFA files in `(t1, t2]`, binned and summed into
+    the *same* WRF grid cells. GLM (like WRF's scheme here) reports total
+    lightning without distinguishing CG from intracloud, so this is a
+    genuinely apples-to-apples comparison, unlike the CG-only comparison in
+    `plot_lightning_cg_comparison`.
+
+    Same rendering conventions as `plot_lightning_cg_comparison` --
+    pcolormesh (not contourf, which silently drops isolated sparse cells),
+    zero-count cells left unfilled, dark background by default. See that
+    function's docstring for why.
+
+    This is a first-cut, not-yet-validated comparison -- see
+    `prompts/lightning_evaluation.md` for the broader plan.
+
+    Parameters
+    ----------
+    wrf_file_t1, wrf_file_t2 : two consecutive wrfout_d0X_* files from a
+        `dyn_lightning_option=1` run (e.g. `rund1-dynlit`).
+    goes_dir : local directory to look for/download GLM-L2-LCFA files into.
+    suptitle : if given, drawn as a big figure-level title.
+    out_file : if given, the figure is saved there.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    wrf_lon, wrf_lat, cg_pos, cg_neg, ic, (t1, t2) = wrf_reader.read_dyn_lightning_flash_counts(
+        wrf_file_t1, wrf_file_t2
+    )
+    wrf_total = cg_pos + cg_neg + ic
+    proj = wrf_reader.get_lambert_projection(wrf_file_t1)
+
+    glm_lon, glm_lat, glm_total, glm_scan_times = lightning_reader.glm_total_counts_on_wrf_grid(
+        wrf_file_t1, t1, t2, goes_dir, satellite=satellite, auto_download=auto_download_glm
+    )
+
+    extent = _domain_extent(wrf_lon, wrf_lat, domain_pad_deg)
+    domain_outline = _domain_outline(wrf_lon, wrf_lat)
+
+    wrf_total_masked = np.where(wrf_total > 0, wrf_total, np.nan)
+    glm_total_masked = np.where(glm_total > 0, glm_total, np.nan)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+    if dark_background:
+        fig.patch.set_facecolor("black")
+
+    n_scans = len(glm_scan_times)
+    glm_title = f"GLM ({satellite})\n({n_scans} 20-s scans summed)"
+    _plot_row(
+        fig, axes,
+        [
+            (wrf_lon, wrf_lat, wrf_total_masked, "WRF"),
+            (glm_lon, glm_lat, glm_total_masked, glm_title),
+        ],
+        count_levels, cmap, extent, domain_outline, extend="max",
+        colorbar_label="Total flashes per grid cell", plot_type="pcolormesh",
+        dark_background=dark_background,
+    )
+
+    if suptitle is not None:
+        fig.suptitle(
+            suptitle, fontsize=16, fontweight="bold", y=0.93,
+            color="white" if dark_background else "black",
+        )
+
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+
+    return fig
+
+
+def plot_run_lightning_cg_comparison(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    mrms_dir: str | Path = "mrms_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_mrms: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_lightning_cg_comparison` that takes an hourly
+    window's start time plus a WRF run's name/directory, locates the
+    matching pair of consecutive-hour wrfout files itself, and labels the
+    figure with a suptitle showing `run_name` and the window.
+
+    Parameters
+    ----------
+    time : the window's *start* time; the run's `wrfout_<domain>_*` files
+        at both `time` and `time + 1h` must exist (so this must be an
+        on-the-hour wrfout time, and not the run's very last one).
+    run_name : label for the run, used in the figure's suptitle.
+    run_dir : directory holding that run's `wrfout_*` files -- must be a
+        `dyn_lightning_option=1` run (e.g. `.../rund1-dynlit`).
+    mrms_dir : directory holding downloaded NLDN files (see
+        `mrms.download_mrms_file`). Defaults to `mrms_data`.
+    domain : WRF domain to plot, e.g. "d01" (default).
+    output_base_dir : if given (and `out_file` isn't passed explicitly via
+        `**kwargs`), auto-saves to
+        `<output_base_dir>/lightning_cg_wrf_mrms_<run_dir's last two path
+        components>_<time>.png`.
+    auto_download_mrms : fetch missing NLDN files from S3 instead of
+        skipping them. False by default, so plotting never triggers a
+        network call unless explicitly asked -- important under a SLURM
+        array on a compute node with no outbound internet.
+    **kwargs : forwarded to `plot_lightning_cg_comparison`.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    time_end = time + dt.timedelta(hours=1)
+    wrf_file_t1 = _find_wrf_file(run_dir, domain, time)
+    wrf_file_t2 = _find_wrf_file(run_dir, domain, time_end)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(output_base_dir, "lightning_cg_wrf_mrms", run_dir, time)
+
+    suptitle = kwargs.pop(
+        "suptitle",
+        f"CG lightning: {run_name}\n{time:%Y-%m-%d %H:%M}-{time_end:%H:%M} UTC",
+    )
+    return plot_lightning_cg_comparison(
+        wrf_file_t1, wrf_file_t2, mrms_dir,
+        auto_download_mrms=auto_download_mrms, suptitle=suptitle, **kwargs,
+    )
+
+
+def plot_run_lightning_total_comparison(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    goes_dir: str | Path = "goes_data",
+    satellite: str = goes_reader.DEFAULT_SATELLITE,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_glm: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_lightning_total_comparison` -- GLM's
+    counterpart of `plot_run_lightning_cg_comparison`; see that function's
+    docstring for the shared conventions (hourly window, output-path
+    naming, why `auto_download_glm` defaults to False).
+
+    **kwargs : forwarded to `plot_lightning_total_comparison`.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    time_end = time + dt.timedelta(hours=1)
+    wrf_file_t1 = _find_wrf_file(run_dir, domain, time)
+    wrf_file_t2 = _find_wrf_file(run_dir, domain, time_end)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(output_base_dir, "lightning_total_wrf_glm", run_dir, time)
+
+    suptitle = kwargs.pop(
+        "suptitle",
+        f"Total lightning: {run_name}\n{time:%Y-%m-%d %H:%M}-{time_end:%H:%M} UTC",
+    )
+    return plot_lightning_total_comparison(
+        wrf_file_t1, wrf_file_t2, goes_dir, satellite=satellite,
+        auto_download_glm=auto_download_glm, suptitle=suptitle, **kwargs,
+    )
+
+
+def plot_lightning_nalma_comparison(
+    wrf_file_t1: str | Path,
+    wrf_file_t2: str | Path,
+    nalma_dir: str | Path,
+    token_file: str | Path = nalma_reader.DEFAULT_TOKEN_FILE,
+    auto_download_nalma: bool = True,
+    wrf_count_levels: np.ndarray = DEFAULT_LIGHTNING_TOTAL_COUNT_LEVELS,
+    nalma_source_levels: np.ndarray = DEFAULT_LIGHTNING_SOURCE_COUNT_LEVELS,
+    cmap: str = "YlGn_r",
+    dark_background: bool = True,
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (11.5, 5.5),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """Compare WRF's total-lightning flash count against NALMA's raw VHF
+    source count, over the interval between two consecutive wrfout times.
+
+    WRF panel: `cg_pos + cg_neg + ic` from
+    `wrf.read_dyn_lightning_flash_counts`, same as
+    `plot_lightning_total_comparison`'s WRF panel.
+
+    NALMA panel: `lightning.nalma_source_counts_on_wrf_grid` -- every VHF
+    source from NALMA granules in `(t1, t2]`, binned and summed into the
+    *same* WRF grid cells.
+
+    **Not a like-for-like count comparison** -- unlike GLM, NALMA's raw
+    data are individual VHF sources, not flash-clustered totals (a flash
+    produces many tens to hundreds of sources; see `nalma.py`'s module
+    docstring). Checked against a real active-storm hour, NALMA sources
+    outnumbered WRF flashes ~51:1 domain-wide -- sharing one color scale
+    between the two panels would wash out the WRF side entirely, so
+    (unlike the CG/GLM comparisons) **each panel gets its own levels and
+    colorbar**: `wrf_count_levels` (same flash-count scale as
+    `plot_lightning_total_comparison`) and `nalma_source_levels` (a much
+    wider range for raw source counts). Read this as a spatial/qualitative
+    check -- does NALMA's activity line up with WRF's and GLM's -- rather
+    than a magnitude comparison. No chi^2/power quality filtering is
+    applied to the raw sources yet (see `nalma.read_nalma_sources`).
+
+    Requires a NASA Earthdata Login token to download NALMA granules
+    (unlike GLM/MRMS's anonymous public buckets) -- see `nalma.py`'s module
+    docstring.
+
+    Same rendering conventions as `plot_lightning_cg_comparison`/
+    `plot_lightning_total_comparison` -- pcolormesh, zero-count cells left
+    unfilled, dark background by default.
+
+    Parameters
+    ----------
+    wrf_file_t1, wrf_file_t2 : two consecutive wrfout_d0X_* files from a
+        `dyn_lightning_option=1` run (e.g. `rund1-dynlit`).
+    nalma_dir : local directory to look for/download NALMA granules into.
+    suptitle : if given, drawn as a big figure-level title.
+    out_file : if given, the figure is saved there.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    wrf_lon, wrf_lat, cg_pos, cg_neg, ic, (t1, t2) = wrf_reader.read_dyn_lightning_flash_counts(
+        wrf_file_t1, wrf_file_t2
+    )
+    wrf_total = cg_pos + cg_neg + ic
+    proj = wrf_reader.get_lambert_projection(wrf_file_t1)
+
+    nalma_lon, nalma_lat, nalma_counts, granule_names = (
+        lightning_reader.nalma_source_counts_on_wrf_grid(
+            wrf_file_t1, t1, t2, nalma_dir, token_file=token_file,
+            auto_download=auto_download_nalma,
+        )
+    )
+
+    extent = _domain_extent(wrf_lon, wrf_lat, domain_pad_deg)
+    domain_outline = _domain_outline(wrf_lon, wrf_lat)
+
+    wrf_total_masked = np.where(wrf_total > 0, wrf_total, np.nan)
+    nalma_counts_masked = np.where(nalma_counts > 0, nalma_counts, np.nan)
+
+    fig, axes = plt.subplots(
+        1, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.05, h_pad=0.02, wspace=0.05, hspace=0.02)
+    if dark_background:
+        fig.patch.set_facecolor("black")
+
+    n_granules = len(granule_names)
+    mesh_wrf = _plot_panel(
+        axes[0], wrf_lon, wrf_lat, wrf_total_masked, wrf_count_levels, cmap, extent,
+        "WRF (flashes)", extend="max", domain_outline=domain_outline,
+        plot_type="pcolormesh", dark_background=dark_background,
+    )
+    mesh_nalma = _plot_panel(
+        axes[1], nalma_lon, nalma_lat, nalma_counts_masked, nalma_source_levels, cmap, extent,
+        f"NALMA\n({n_granules} granules summed)", extend="max", domain_outline=domain_outline,
+        plot_type="pcolormesh", dark_background=dark_background,
+    )
+    cbar_wrf = fig.colorbar(mesh_wrf, ax=axes[0], label="Flashes per grid cell", shrink=0.5, pad=0.02)
+    cbar_nalma = fig.colorbar(
+        mesh_nalma, ax=axes[1], label="VHF sources per grid cell", shrink=0.5, pad=0.02
+    )
+    if dark_background:
+        for cbar, label in (
+            (cbar_wrf, "Flashes per grid cell"), (cbar_nalma, "VHF sources per grid cell")
+        ):
+            cbar.set_label(label, color="white")
+            cbar.ax.yaxis.set_tick_params(color="white")
+            plt.setp(plt.getp(cbar.ax, "yticklabels"), color="white")
+
+    if suptitle is not None:
+        fig.suptitle(
+            suptitle, fontsize=16, fontweight="bold", y=0.93,
+            color="white" if dark_background else "black",
+        )
+
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+
+    return fig

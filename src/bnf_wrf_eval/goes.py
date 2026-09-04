@@ -37,6 +37,16 @@ S3_BUCKET_BY_SATELLITE = {
 # L1b radiance product).
 PRODUCT = "ABI-L2-CMIPC"
 
+# Geostationary Lightning Mapper Level 2 Lightning Cluster-Filter Algorithm
+# output: total lightning (intracloud + cloud-to-cloud + cloud-to-ground,
+# undifferentiated -- GLM's optical detection can't tell them apart) flash
+# centroids, one file per ~20-second scan, full-disk coverage (not sectored
+# like CMIP). Confirmed against a real file: `flash_lat`/`flash_lon` are
+# already flash-level (not event/group-level, which would need clustering
+# first -- see `read_glm_flashes`), and `time_coverage_start`/
+# `time_coverage_end` give the file's exact window.
+GLM_PRODUCT = "GLM-L2-LCFA"
+
 # GOES-R CMIP files' "t" (scan midpoint) variable is seconds since this
 # fixed epoch (the files don't vary this).
 _GOES_EPOCH = dt.datetime(2000, 1, 1, 12, 0, 0)
@@ -184,6 +194,127 @@ def download_goes_file(bucket: str, key: str, dest_dir: str | Path) -> Path:
     )
         s3.download_file(bucket, key, str(dest))
     return dest
+
+
+def find_glm_files_in_range(
+    time_start: dt.datetime,
+    time_end: dt.datetime,
+    satellite: str = DEFAULT_SATELLITE,
+) -> list[tuple[str, str, dt.datetime]]:
+    """List every GLM-L2-LCFA file (one per ~20-second scan) starting in
+    `(time_start, time_end]`, sorted by scan start time -- for accumulating
+    total-lightning flash counts across a comparison window (analogous to
+    `mrms.find_mrms_files_in_range` for NLDN).
+
+    Objects are keyed by `<product>/<year>/<day-of-year>/<hour>/<file>`, so
+    (unlike a flat per-day listing) each hour's prefix holds only ~180
+    files -- comfortably under S3's 1000-key-per-response cap, so no
+    pagination is needed here the way `mrms.find_mrms_files_in_range`
+    needed it for the 1-min NLDN product.
+
+    Returns a list of (bucket, key, scan_start_time) tuples; empty if
+    nothing falls in the window.
+    """
+    import boto3
+    from botocore import UNSIGNED
+    from botocore.config import Config
+
+    bucket = S3_BUCKET_BY_SATELLITE[satellite]
+    s3 = boto3.client(
+        "s3",
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=10,
+            read_timeout=30,
+            retries={"max_attempts": 2},
+        ),
+    )
+
+    hours_to_check = set()
+    t = time_start.replace(minute=0, second=0, microsecond=0)
+    while t <= time_end:
+        hours_to_check.add(t)
+        t += dt.timedelta(hours=1)
+    hours_to_check.add(time_end.replace(minute=0, second=0, microsecond=0))
+
+    candidates = []
+    for hour in sorted(hours_to_check):
+        prefix = f"{GLM_PRODUCT}/{hour:%Y}/{hour:%j}/{hour:%H}/OR_{GLM_PRODUCT}_{satellite}_s"
+        resp = s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        candidates.extend(resp.get("Contents", []))
+
+    matches = []
+    for obj in candidates:
+        scan_start = _goes_scan_start_from_name(Path(obj["Key"]).name)
+        if time_start < scan_start <= time_end:
+            matches.append((bucket, obj["Key"], scan_start))
+    matches.sort(key=lambda item: item[2])
+    return matches
+
+
+def find_local_glm_files_in_range(
+    time_start: dt.datetime,
+    time_end: dt.datetime,
+    goes_dir: str | Path,
+    satellite: str = DEFAULT_SATELLITE,
+) -> list[tuple[str, str, dt.datetime]]:
+    """Local counterpart of `find_glm_files_in_range`: every already-
+    downloaded GLM-L2-LCFA file in `goes_dir` starting in `(time_start,
+    time_end]`, resolved purely from filenames -- no S3 call.
+
+    Use this on hosts without outbound internet (compute nodes): unlike
+    `find_local_goes_file`'s single closest-match lookup,
+    `find_glm_files_in_range` (needed to accumulate a whole window) always
+    lists S3 to discover what exists, even when every file is already
+    local. Pre-populate `goes_dir` with `scripts/download_obs.py` from a
+    host that has internet.
+
+    Returns a list of `("", path_as_str, scan_start_time)` tuples (empty
+    bucket, since there's nothing to download) sorted by scan start time,
+    in the same shape `find_glm_files_in_range` returns -- so callers can
+    treat the two interchangeably.
+    """
+    goes_dir = Path(goes_dir)
+    matches = []
+    for path in goes_dir.glob(f"OR_{GLM_PRODUCT}_{satellite}_s*.nc"):
+        try:
+            scan_start = _goes_scan_start_from_name(path.name)
+        except (IndexError, ValueError):
+            continue
+        if time_start < scan_start <= time_end:
+            matches.append(("", str(path), scan_start))
+    matches.sort(key=lambda item: item[2])
+    return matches
+
+
+def read_glm_flashes(
+    glm_file: str | Path,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime, dt.datetime]:
+    """Read flash centroid lon/lat/energy from a downloaded GLM-L2-LCFA
+    file.
+
+    Flashes here are total lightning (IC + CC + CG, undifferentiated --
+    GLM's optical detection can't tell them apart; see the module
+    docstring's `GLM_PRODUCT` note), already clustered from the raw
+    events/groups by the L2 processing (`flash_lat`/`flash_lon`), so no
+    further clustering is needed the way NALMA's raw VHF sources would.
+
+    Returns (flash_lon, flash_lat, flash_energy, scan_start, scan_end);
+    `flash_energy` is in Joules. All three arrays are empty (shape (0,))
+    for a file with no flashes in its ~20-second window, which is common
+    outside active convection.
+    """
+    import netCDF4
+
+    with netCDF4.Dataset(glm_file) as nc:
+        flash_lon = np.asarray(nc.variables["flash_lon"][:])
+        flash_lat = np.asarray(nc.variables["flash_lat"][:])
+        flash_energy = np.asarray(nc.variables["flash_energy"][:])
+        scan_start = dt.datetime.strptime(
+            nc.time_coverage_start, "%Y-%m-%dT%H:%M:%S.%fZ"
+        )
+        scan_end = dt.datetime.strptime(nc.time_coverage_end, "%Y-%m-%dT%H:%M:%S.%fZ")
+    return flash_lon, flash_lat, flash_energy, scan_start, scan_end
 
 
 def read_brightness_temperature(

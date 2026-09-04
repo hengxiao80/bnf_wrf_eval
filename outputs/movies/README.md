@@ -6,10 +6,13 @@ HRRR analyses that drove them and against independent satellite / radar
 observations, for the DOE ARM Bankhead National Forest (BNF) site in northern
 Alabama.
 
-All 84 movies (72 d1 + 12 d2) are H.264 (`yuv420p`), **12 fps, no audio**. At
-12 fps an hourly (73-frame) movie runs ~6 s, a 15-min (289-frame) movie ~24 s, and
-the 5-min GOES movies (~865 frames) ~72 s. The d2 comparison movies are hourly and
-shorter (15–24 frames — those runs cover only 14–23 h; see below).
+All 90 movies (72 d1 + 12 d2 + 6 lightning) are H.264 (`yuv420p`), **12 fps, no
+audio**. At 12 fps an hourly (73-frame) movie runs ~6 s, a 15-min (289-frame)
+movie ~24 s, and the 5-min GOES movies (~865 frames) ~72 s. The d2 comparison
+movies are hourly and shorter (15–24 frames — those runs cover only 14–23 h;
+see below). The lightning movies are hourly and 72 frames (one shorter than a
+normal 73-frame hourly movie, since each frame differences *two* consecutive
+hours and the run's last hour has no successor to pair with; see below).
 
 ## The runs
 
@@ -156,6 +159,42 @@ outlined in red, BNF star on every panel.
 6 of each (3 cases × `rund2` / `rund2-dynlit`). Frame counts per case: 24
 (`20250502`), 18 (`20250520`), 15 (`20250917`).
 
+### Lightning movies (hourly, 72 frames each) — 6 files
+
+WRF's dynamics-based lightning-threat diagnostic (`rund1-dynlit`,
+`dyn_lightning_option=1`; Lynn et al. 2012) against two independent observed
+lightning sources, for each case's `rund1-dynlit` run only (the other three
+d1 schemes don't have the diagnostic enabled). Unlike the Tb/reflectivity
+comparisons above, lightning is inherently an *accumulated-count* quantity,
+not an instantaneous field: each frame differences WRF's cumulative flash
+counts (`LPOS`/`LNEG`/`LNEU`, confirmed to be running totals since simulation
+start, not per-output-interval values) between two consecutive on-the-hour
+`wrfout` times, and sums the observation source's raw data over that same
+hour, so the two sides are counting flashes over an identical window.
+
+| File pattern | Layout | WRF quantity | Obs. quantity |
+|--------------|--------|--------------|----------------|
+| `lightning_cg_wrf_mrms_<case>_rund1-dynlit.mp4` | 2-panel: WRF \| MRMS/NLDN | Cloud-to-ground flash count (`LPOS + LNEG` difference) | MRMS `NLDN_CG_001min_AvgDensity` (ground-based NLDN CG network), every 1-min sample in the hour binned onto the WRF grid and summed |
+| `lightning_total_wrf_glm_<case>_rund1-dynlit.mp4` | 2-panel: WRF \| GLM | Total (CG + intracloud) flash count (`LPOS + LNEG + LNEU` difference) | GOES-19 GLM-L2-LCFA flash centroids (satellite optical total-lightning detection), every ~20-s scan in the hour binned onto the WRF grid and summed |
+
+3 of each (one per case). Both use a **black background** (`YlGn_r`: dark
+green for common low counts, brighter yellow-green for higher counts, forced
+to white for any cell exceeding the top color level, so the most intense
+storm-core cells can never blend into the background) rather than this
+project's usual white-background map style — flash counts are sparse and
+mostly-zero, and pcolormesh (not contourf, which silently drops isolated
+single-cell values surrounded by no-data neighbors) renders each grid cell on
+its own. `lightning_total`'s color levels run higher (up to 200) than
+`lightning_cg`'s (up to 100), since total lightning (CG + intracloud) is a
+larger count than CG alone.
+
+A raw-VHF-source (not flash-clustered) comparison against NALMA also exists
+(`plotting.plot_lightning_nalma_comparison`) but isn't part of this movie set
+yet — NALMA source counts run roughly 50x flash counts (a flash produces many
+VHF sources as its channel propagates), and converting sources to flash/
+cluster counts (matching the standard LMA flash-clustering algorithm) hasn't
+been done; see `prompts/lightning_evaluation.md`.
+
 ## Filename key
 
     <type>_<case>lassobnfwrfhrrr3[_<run>].mp4
@@ -164,4 +203,5 @@ outlined in red, BNF star on every panel.
 - `<run>` — for the d1 movies: `rund1`, `rund1-mp52`, `rund1-mp53`, or
   `rund1-dynlit` (WRF single-panel movies; d1 comparison movies are `rund1` /
   `rund1-mp52` / `rund1-mp53` only, and `rund1-dynlit` has only `wrf_olr_tb` /
-  `wrf_refl`). For the `d2_*_4panel` movies: `rund2` or `rund2-dynlit`.
+  `wrf_refl`, plus both `lightning_*` movies, which are `rund1-dynlit` only).
+  For the `d2_*_4panel` movies: `rund2` or `rund2-dynlit`.

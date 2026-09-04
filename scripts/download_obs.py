@@ -15,8 +15,14 @@ Run this once first; then run ``batch_plot`` without ``--auto-download``.
     # single-panel movies
     python scripts/download_obs.py --which goes,mrms --cadence-mrms 15
 
+    # continuous 1-min NLDN + ~20-s GLM, for the hourly-accumulated
+    # lightning comparison movies (every file in range is fetched, not
+    # one per cadence mark -- the plots sum every sample in each window)
+    python scripts/download_obs.py --which nldn,glm
+
 Anonymous S3 (NOAA Open Data), no credentials. Idempotent: files already
-present are skipped.
+present are skipped. NLDN shares `--mrms-dir` (it's a MRMS product); GLM
+shares `--goes-dir` (a GOES product).
 """
 
 from __future__ import annotations
@@ -48,6 +54,11 @@ GOES_SAT = "G19"
 
 MRMS_BUCKET = "noaa-mrms-pds"
 MRMS_PRODUCT = "MergedReflectivityQCComposite_00.50"
+NLDN_PRODUCT = "NLDN_CG_001min_AvgDensity_00.00"
+
+GLM_BUCKET = "noaa-goes19"
+GLM_PRODUCT = "GLM-L2-LCFA"
+GLM_SAT = "G19"
 
 
 def _s3():
@@ -130,6 +141,39 @@ def list_mrms_keys(
     return sorted(set(chosen))
 
 
+def list_nldn_keys(s3, start: dt.datetime, end: dt.datetime) -> list[str]:
+    """Every 1-min NLDN CG lightning-density object in [start, end] --
+    unlike `list_mrms_keys`, every file is needed (not one per cadence
+    mark), since the lightning comparison plots sum every 1-min sample
+    across each hourly accumulation window with no gaps allowed."""
+    keys: list[str] = []
+    day = start.date()
+    while day <= end.date():
+        prefix = f"CONUS/{NLDN_PRODUCT}/{day:%Y%m%d}/MRMS_{NLDN_PRODUCT}_{day:%Y%m%d}-"
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=MRMS_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if start <= _mrms_scan_time(obj["Key"]) <= end:
+                    keys.append(obj["Key"])
+        day += dt.timedelta(days=1)
+    return sorted(set(keys))
+
+
+def list_glm_keys(s3, start: dt.datetime, end: dt.datetime) -> list[str]:
+    """Every ~20-second GLM-L2-LCFA object in [start, end] -- every file is
+    needed (same reasoning as `list_nldn_keys`)."""
+    keys: list[str] = []
+    hour = start.replace(minute=0, second=0, microsecond=0)
+    last = end.replace(minute=0, second=0, microsecond=0)
+    while hour <= last:
+        prefix = f"{GLM_PRODUCT}/{hour:%Y}/{hour:%j}/{hour:%H}/OR_{GLM_PRODUCT}_{GLM_SAT}_s"
+        for page in s3.get_paginator("list_objects_v2").paginate(Bucket=GLM_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                if start <= _goes_scan_time(obj["Key"]) <= end:
+                    keys.append(obj["Key"])
+        hour += dt.timedelta(hours=1)
+    return sorted(set(keys))
+
+
 def download_all(bucket: str, keys: list[str], dest_dir: Path, workers: int) -> tuple[int, int]:
     dest_dir.mkdir(parents=True, exist_ok=True)
     todo = [k for k in keys if not (dest_dir / Path(k).name).exists()]
@@ -154,7 +198,7 @@ def download_all(bucket: str, keys: list[str], dest_dir: Path, workers: int) -> 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--which", default="goes,mrms", help="comma list: goes, mrms")
+    p.add_argument("--which", default="goes,mrms", help="comma list: goes, mrms, nldn, glm")
     p.add_argument("--hourly", action="store_true",
                    help="restrict both products to one file per hour")
     p.add_argument("--cadence-mrms", type=int, default=15,
@@ -171,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
 
     goes_keys: list[str] = []
     mrms_keys: list[str] = []
+    nldn_keys: list[str] = []
+    glm_keys: list[str] = []
     for case in CASES:
         start, end = _case_span(case)
         print(f"{case}: {start:%Y-%m-%d %H:%M} .. {end:%Y-%m-%d %H:%M} UTC")
@@ -184,10 +230,20 @@ def main(argv: list[str] | None = None) -> int:
             mk = list_mrms_keys(s3, start, end, mrms_cadence)
             print(f"  MRMS (every {mrms_cadence} min): {len(mk)} files")
             mrms_keys += mk
+        if "nldn" in which:
+            nk = list_nldn_keys(s3, start, end)
+            print(f"  NLDN (every 1 min): {len(nk)} files")
+            nldn_keys += nk
+        if "glm" in which:
+            glk = list_glm_keys(s3, start, end)
+            print(f"  GLM (every ~20 s): {len(glk)} files")
+            glm_keys += glk
 
     goes_keys = sorted(set(goes_keys))
     mrms_keys = sorted(set(mrms_keys))
-    print(f"\ntotal: {len(goes_keys)} GOES, {len(mrms_keys)} MRMS")
+    nldn_keys = sorted(set(nldn_keys))
+    glm_keys = sorted(set(glm_keys))
+    print(f"\ntotal: {len(goes_keys)} GOES, {len(mrms_keys)} MRMS, {len(nldn_keys)} NLDN, {len(glm_keys)} GLM")
     if args.dry_run:
         return 0
 
@@ -197,6 +253,14 @@ def main(argv: list[str] | None = None) -> int:
     if mrms_keys:
         ok, fail = download_all(MRMS_BUCKET, mrms_keys, Path(args.mrms_dir), args.workers)
         print(f"MRMS: {ok} downloaded, {fail} failed")
+    if nldn_keys:
+        # NLDN is a MRMS product, so shares mrms_dir.
+        ok, fail = download_all(MRMS_BUCKET, nldn_keys, Path(args.mrms_dir), args.workers)
+        print(f"NLDN: {ok} downloaded, {fail} failed")
+    if glm_keys:
+        # GLM is a GOES product, so shares goes_dir.
+        ok, fail = download_all(GLM_BUCKET, glm_keys, Path(args.goes_dir), args.workers)
+        print(f"GLM: {ok} downloaded, {fail} failed")
     return 0
 
 

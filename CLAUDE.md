@@ -131,7 +131,12 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
 - `src/bnf_wrf_eval/` -- the package (`src` layout).
   - `wrf.py` -- reads wrfout NetCDF fields (`read_field`, `read_column_max_reflectivity`,
     `read_cloud_top_temperature`) and builds the domain's cartopy Lambert Conformal projection
-    (`get_lambert_projection`).
+    (`get_lambert_projection`). Also `read_dyn_lightning_flash_counts` (per-grid-cell CG-positive/
+    CG-negative/intracloud flash counts between two wrfout times, from WRF's Dynamic Lightning
+    Scheme -- see "Lightning evaluation" below) and `read_cell_edges_xy` (the domain's exact
+    mass-cell edges in Lambert x/y, from the staggered `XLAT_U`/`XLONG_U`/`XLAT_V`/`XLONG_V`
+    arrays rather than approximated from mass-point centers -- used by `lightning.py`'s
+    observation-gridding).
   - `hrrr.py` -- reads HRRR native-level analysis GRIB2 fields by GRIB2 metadata (`read_composite_reflectivity`,
     `read_olr`, `read_simulated_brightness_temperature`). Lazily bootstraps `eccodes`/`ecmwflibs` on first actual
     use (see `_eccodes_setup.py`) rather than at import time.
@@ -139,9 +144,41 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     temperature from the public `noaa-goes19` AWS Open Data S3 bucket (anonymous, no credentials). `find_goes_file`
     hits S3 to locate the nearest scan; `find_local_goes_file` resolves an already-downloaded file purely from
     local filenames (**no network** -- see the compute-node note below). boto3 clients carry connect/read timeouts
-    so a stray S3 call on an offline host fails in seconds instead of hanging.
+    so a stray S3 call on an offline host fails in seconds instead of hanging. Also GLM-L2-LCFA (Geostationary
+    Lightning Mapper total-lightning flash data, same bucket/satellite -- see "Lightning evaluation" below):
+    `find_glm_files_in_range`/`read_glm_flashes` for a whole time window (`flash_lat`/`flash_lon`/`flash_energy`,
+    already flash-clustered by the L2 processing) and `find_local_glm_files_in_range`, the no-S3-call local
+    counterpart -- `find_glm_files_in_range` always lists S3 to discover what exists even when every file is
+    already local, so anything running under a job array on a compute node must use the local version.
   - `mrms.py` -- finds/downloads/reads MRMS composite reflectivity from the public `noaa-mrms-pds` AWS Open Data
-    S3 bucket. `find_local_mrms_file` is the no-network local-filename resolver, same as `goes.py`'s.
+    S3 bucket. `find_local_mrms_file` is the no-network local-filename resolver, same as `goes.py`'s. Also NLDN
+    ground-based cloud-to-ground lightning density (`NLDN_CG_001min_AvgDensity`, same bucket -- see "Lightning
+    evaluation" below): `read_nldn_cg_density` (its `-1` sentinel means "zero flashes this minute", confirmed
+    against a real file to cover 99.997% of the CONUS grid -- not a missing-coverage flag, since NLDN's ground
+    sensors have near-complete CONUS coverage), `find_mrms_files_in_range`/`find_local_mrms_files_in_range`
+    (paginated -- an earlier unpaginated version silently truncated at S3's 1000-key response cap, missing
+    everything after ~17:00 UTC on a given day for this ~1440-file/day product).
+  - `lightning.py` -- grids raw lightning observations onto a WRF domain's native grid for comparison
+    against WRF's Dynamic Lightning Scheme flash counts; see "Lightning evaluation" below for the full
+    picture. `bin_points_to_wrf_grid` is the shared primitive (projects both the WRF grid's exact cell
+    edges and the observation points through the same Lambert projection, then bins -- a 2D histogram
+    with a per-point weight rather than a plain count); `mrms_cg_counts_on_wrf_grid`,
+    `glm_total_counts_on_wrf_grid`, and `nalma_source_counts_on_wrf_grid` are the three observation-source
+    wrappers around it, each summing over an arbitrary `(time_start, time_end]` window.
+  - `nalma.py` -- finds/downloads/reads North Alabama Lightning Mapping Array (NALMA) raw VHF source data
+    from NASA's GHRC DAAC. Unlike GLM, NALMA's granule *search* (`find_nalma_files_in_range`, NASA CMR API)
+    is anonymous but the actual file *download* (`download_nalma_file`) needs a NASA Earthdata Login
+    token (confirmed: GHRC's protected download endpoint 401s without one) -- read from a local file
+    (default `~/.edl_token`, a bare token string) rather than accepted as a function argument anywhere it
+    could get logged. NALMA's raw data are individual VHF sources, not flash-clustered totals -- confirmed
+    against a real 10-minute granule (399,149 sources) and against a full active-storm hour (~3 million
+    sources vs. WRF's 58,441 flashes over the same window, ~51 sources/flash, consistent with LMA
+    literature) -- so `nalma`-vs-WRF comparisons are not a like-for-like flash count and need their own,
+    much wider color scale (`plotting.plot_lightning_nalma_comparison` gives each panel its own levels/
+    colorbar rather than sharing one). Converting sources to flash/cluster counts (the standard LMA
+    flash-clustering algorithm: sources within 0.3 s in time and a range-dependent spatial limit from the
+    network center are the same flash, McCaul et al. 2009 citing Thomas et al. 2003) was scoped but not
+    implemented -- see `prompts/lightning_evaluation.md`.
   - `crtm.py` -- **working, verified against real WRF output** (2026-08-28): computes simulated GOES-East ABI
     channel 13 Tb directly from WRF's own state via CRTM (through JCSDA's `pyCRTM`), the same forward-model
     approach UPP uses for HRRR's `SBT114` -- for a fairer WRF-vs-HRRR-vs-GOES comparison than
@@ -274,19 +311,26 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`), the seven single-panel series (`wrf_tb`,
     `wrf_refl`, `wrf_olr_tb`, `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`), and the two d2 (500-m) hourly
     4-panel comparisons (`d2_tb4`, `d2_refl4`; group `d2`, scope `d2run`, iterating `D2_SCHEMES` = `rund2` /
-    `rund2-dynlit` x the three `*hrrr3` cases -- see "d2 (500-m ndown run) 4-panel comparisons" above) into
-    `<output-root>/frames/<type>/`.
+    `rund2-dynlit` x the three `*hrrr3` cases -- see "d2 (500-m ndown run) 4-panel comparisons" above), and the
+    two hourly lightning comparisons (`lightning_cg`, `lightning_total`; group `lightning`, scope `dynlit` ->
+    `DYNLIT_SCHEMES` = `rund1-dynlit` only, since it's the only scheme with `dyn_lightning_option=1` -- see
+    "Lightning evaluation" below) into `<output-root>/frames/<type>/`.
     `wrf_olr_tb` (WRF's OLR-fit Tb, `wrf.read_brightness_temperature_from_olr`, on the shared Tb colour scale) is
     the single-panel counterpart of the `tb4_simple` top-left panel; like `wrf_refl` it reads one `wrfout` field
-    and needs no CRTM cache. Run as
+    and needs no CRTM cache. The two lightning types are the only ones needing a *pair* of consecutive on-the-hour
+    `wrfout` times rather than a single one (WRF's flash counts are differenced between them), so
+    `PAIRED_TYPES` drops each run's very last hourly timestamp from the work list (no successor to pair with)
+    rather than the single-time convention every other type uses. Run as
     `python -m bnf_wrf_eval.batch_plot --which comparison|single|all|<types>`; `scripts/batch_plot.sbatch` is the
-    64-task array. **The observation files must be local already** (`scripts/download_obs.py`): `batch_plot`
-    resolves them via `find_local_*_file` and never calls S3 on the compute node.
+    64-task array (unmodified for the lightning types -- `WHICH=lightning` just selects them). **The observation
+    files must be local already** (`scripts/download_obs.py`): `batch_plot` resolves them via `find_local_*_file`/
+    `find_local_*_files_in_range` and never calls S3 on the compute node.
   - `make_movies.py` -- stitches the `batch_plot` PNGs into per-run / per-case MP4s. Groups frames by everything
     in the filename before the trailing `_<YYYYMMDD_HHMM>Z.png` stamp, sorts by that stamp, pads each frame on
-    white to the group's max width/height (no rescale -- `bbox_inches="tight"` makes frame sizes vary by a few
+    white (or black, for `DARK_TYPES` -- the two lightning types, which render on a black background) to the
+    group's max width/height (no rescale -- `bbox_inches="tight"` makes frame sizes vary by a few
     px), and encodes H.264 (`yuv420p`, 12 fps) via `imageio` + `imageio-ffmpeg`'s bundled static ffmpeg (there is
-    no system `ffmpeg` here). Run as `python -m bnf_wrf_eval.make_movies --which comparison|single|all`.
+    no system `ffmpeg` here). Run as `python -m bnf_wrf_eval.make_movies --which comparison|single|all|lightning`.
   - `plotting.py` -- the comparison plots described above (the d1 3-panel / 4-panel families *and* the d2
     `plot_d2_*_comparison_4panel` / `plot_run_d2_*_comparison_4panel` pair -- see "d2 (500-m ndown run) 4-panel
     comparisons" above, and note that d2's Tb plots are OLR-derived for every model panel, unlike d1's
@@ -310,6 +354,18 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     can't match the aspect-shrunk map). The obs wrappers resolve the observation file **locally first**
     (`_resolve_goes_file` / `_resolve_mrms_file` -> `find_local_*_file`), only falling back to the S3
     `find_*_file` when `auto_download_*=True`.
+    Also the lightning comparison plots -- `plot_lightning_cg_comparison` / `plot_run_lightning_cg_comparison`
+    (WRF CG flashes vs. MRMS/NLDN) and `plot_lightning_total_comparison` / `plot_run_lightning_total_comparison`
+    (WRF total flashes vs. GLM), plus `plot_lightning_nalma_comparison` (WRF flashes vs. NALMA VHF sources, not
+    yet wired into `batch_plot`) -- see "Lightning evaluation" below for the full picture. These are the first
+    plots in this project to use `plot_type="pcolormesh"` (added as an option on the shared `_plot_panel`/
+    `_plot_row`, alongside the original `"contourf"`) and `dark_background=True` (also a `_plot_panel`/
+    `_plot_row` option): `contourf` silently drops isolated single-cell values with no-data neighbors -- fine
+    for smooth continuous fields like dBZ/K, wrong for sparse mostly-zero flash counts -- and a black
+    background with a reversed sequential colormap (`YlGn_r`: dark green for common low counts, bright
+    yellow-green for high counts, forced to white above the top color level) makes the sparse cells and the
+    rare true maxima both stand out, which a light background with a normal-direction colormap couldn't do
+    for both ends at once.
   - **Compute nodes here have no outbound internet.** Any boto3 S3 call (`goes.find_goes_file`,
     `mrms.find_mrms_file`, `download_*`) blocks indefinitely on TCP connect there -- this silently hung every
     task of a plotting job array until the local-filename resolvers above were added. Pre-download all
@@ -339,6 +395,9 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     the plots need, for the three case windows, into `goes_data/` / `mrms_data/`. `--hourly` (for the comparison
     plots) or `--which goes,mrms --cadence-mrms 15` (GOES native ~5 min + MRMS every 15 min, for the single-panel
     movies). Idempotent. **Run this from a login node before `batch_plot.sbatch`** (compute nodes can't reach S3).
+    `--which nldn,glm` fetches *every* file in each run's full 72-h span (not one per cadence mark -- the
+    lightning plots sum every sample in each hourly window with no gaps) for the lightning movies: NLDN shares
+    `--mrms-dir`, GLM shares `--goes-dir`.
   - `batch_plot.sbatch` -- 64-task SLURM array (32 concurrent) driving `bnf_wrf_eval.batch_plot`; `WHICH=`
     (comparison | single | all | type list), `OUTPUT_ROOT=`, `EXTRA=` overrides. Restartable (skips existing
     frames). ~52 s/frame for the 4-panel `tb4` under 32-wide packing (the `ctt` diagnostic dominates), a few
@@ -357,7 +416,9 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored. `crtm_cache/` is currently fully
   populated (~6.5 GB) with all 2601 15-min snapshots of the 9 d1 HRRR3 runs, cache-key version `2026-08-29a` --
   see the "CRTM Tb pre-computation" note under `crtm.py`. `outputs/frames/<type>/` and `outputs/movies/` hold the
-  batch-rendered frames and MP4s -- see the "Plots and movies" note below.
+  batch-rendered frames and MP4s -- see the "Plots and movies" note below. `mrms_data/` and `goes_data/` also
+  hold the full-72-h-span NLDN (~1.4 GB) and GLM (~30 GB) files the lightning movies need -- see "Lightning
+  evaluation" below.
 - `satoshi_forcing_data/` and `satoshi_testruns/` -- symlinks into shared project storage
   (`/gpfs/wolf2/arm/cli120/proj-shared/sey/bnf/wrf/...`), **not part of the git repo** (untracked, and large).
   - `satoshi_forcing_data/` holds reference/forcing datasets (`era5/`, `era5rda/`, `hrrr/`).
@@ -412,3 +473,86 @@ movies. Single-panel plots deliberately have **no
 per-panel title**, a suptitle carrying the field's *actual* valid/scan time, a colorbar drawn to the exact
 height of the (aspect-shrunk) map, and colorbar labels `Brightness Temp. (K)` / `Comp. Refl (dBZ)`; the GOES
 suptitle reads `GOES-<n> (#<channel>)`.
+
+## Lightning evaluation
+
+Comparing `rund1-dynlit`'s WRF flash counts against three independent observation sources, for the 9 d1
+HRRR3 runs' one `rund1-dynlit` scheme per case (3 runs total). Task prompt: `prompts/lightning_evaluation.md`;
+`prompts/lightning_threat_verification_notes.md` has background on HRRR's separate McCaul et al. (2009)-based
+`ltng` field (a different, UPP-side lightning proxy, not directly related to WRF's own scheme below).
+
+**WRF's Dynamic Lightning Scheme** (`dyn_lightning_option=1`, new in WRF v4.8.0; Lynn, Yair, Price, Kelman &
+Clark, 2012, Wea. Forecasting, 27, 1470-1486 -- confirmed against the actual v4.8.0 source, not the similarly
+named but unrelated scheme in an Italy-focused 2022 paper this was first mis-attributed to) tracks three 3-D
+prognostic charge-potential-energy fields (`LIGHTNING_PE`/`LIGHTNING_NE`/`LIGHTNING_NEU`) and, whenever a
+column's accumulated energy crosses a (grid-spacing-scaled) threshold, increments three 2-D **running-total**
+stroke-count fields: `LPOS`/`LNEG` (positive/negative cloud-to-ground) and `LNEU` (intracloud). Confirmed from
+`phys/module_ltng_strokes.F`'s `flash` subroutine (`lpos = lpos + int(e_p/j_pos)`, a state variable never reset)
+and empirically (their domain sums only ever increase across a run's `wrfout` files) that these are cumulative
+since simulation start, not per-output-interval counts -- so a flash count for any window is the *difference*
+of these fields between two `wrfout` times (`wrf.read_dyn_lightning_flash_counts`).
+
+**Three observation sources**, each with a different unit/coverage caveat:
+
+- **MRMS/NLDN** (`mrms.read_nldn_cg_density`, `lightning.mrms_cg_counts_on_wrf_grid`) -- ground-based ("NLDN",
+  Vaisala's National Lightning Detection Network) **cloud-to-ground-only** flash density, gridded onto MRMS's
+  ~1-km CONUS grid at 1-min cadence, apples-to-apples against `LPOS + LNEG`.
+- **GOES GLM** (`goes.read_glm_flashes`, `lightning.glm_total_counts_on_wrf_grid`) -- satellite optical
+  **total lightning** (IC + CC + CG, undifferentiated -- GLM's detection can't separate them), already
+  flash-clustered, ~20-s cadence, apples-to-apples against `LPOS + LNEG + LNEU`.
+- **NALMA** (`nalma.py`, `lightning.nalma_source_counts_on_wrf_grid`) -- ground-based total-lightning VHF
+  *sources* (not flash-clustered; ~51 sources per flash empirically, see `nalma.py`'s module docstring above),
+  needing a NASA Earthdata Login token, not yet converted to flash/cluster counts, not yet in the movie set.
+
+Both GLM and NALMA detect total lightning the same way (VHF/optical emission throughout the whole discharge
+channel, including its ground-reaching portion, with no way to separate CG from IC after the fact) -- neither
+the GLM L2 product nor NALMA's raw source data carries a CG/IC flag.
+
+**Grid binning** (`lightning.bin_points_to_wrf_grid`): both the WRF grid's cell edges and every observation
+point are projected through the *same* Lambert projection (`wrf.get_lambert_projection`) before binning, so
+this is never comparing raw lat/lon against a rotated grid. Cell edges come from `wrf.read_cell_edges_xy`,
+which reduces the projected staggered `XLAT_U`/`XLONG_U`/`XLAT_V`/`XLONG_V` arrays to one representative row/
+column (checked empirically against a real wrfout: the projected coordinate varies by only ~2-3 m across the
+whole domain between the first and last row/column, out of a 2500 m cell -- consistent with WRF's grid being
+exactly regular in its own native projection by construction, the residual explained by `XLONG_U` being
+stored as float32 in the file).
+
+**Rendering**: `plotting.plot_lightning_cg_comparison` / `plot_lightning_total_comparison` (2-panel: WRF |
+obs, both already on the WRF grid after binning) and `plot_lightning_nalma_comparison` (2-panel, but with
+*separate* per-panel levels/colorbars, since NALMA sources and WRF flashes are different scales). All three
+use `plot_type="pcolormesh"` (not the other comparison plots' `"contourf"`, which silently drops isolated
+single-cell values -- wrong for sparse, mostly-zero flash counts) and `dark_background=True` (black
+figure/axes, white map features/text) with a reversed `YlGn_r` colormap (dark green for common low counts,
+bright yellow-green for high counts, forced to white above the top color level via `cmap.set_over`) -- picked
+after several iterations so that *both* the common low-count cells and the rare true-maximum cells stand out,
+which no single-direction light-or-dark-background combination could do for both ends at once.
+`DEFAULT_LIGHTNING_COUNT_LEVELS` (CG, tops out at 100 -- checked against a real active hour, CG counts never
+actually reach it) vs. `DEFAULT_LIGHTNING_TOTAL_COUNT_LEVELS` (total, tops out at 200 -- CG+IC counts do
+reach the hundreds) vs. `DEFAULT_LIGHTNING_SOURCE_COUNT_LEVELS` (NALMA, 10-10,000, a completely different
+scale for raw VHF sources).
+
+**Batch pipeline**: `batch_plot.py`'s `lightning_cg`/`lightning_total` types (group `lightning`, scope
+`dynlit` -> `rund1-dynlit` only), fed by `plotting.plot_run_lightning_cg_comparison`/
+`plot_run_lightning_total_comparison` wrappers, with hourly frames (each differencing two consecutive
+on-the-hour `wrfout` times) -- 72 frames/run (73 hourly times, less 1 for the run's last hour having no
+successor to pair with). A real bug was caught and fixed here: the S3-listing functions
+(`mrms.find_mrms_files_in_range`, `goes.find_glm_files_in_range`) that discover which files exist in a time
+window were being called *unconditionally*, even when every file was already local and `auto_download=False`
+-- exactly the "compute node blocks forever with no outbound internet" hazard flagged elsewhere in this file,
+just not yet hit in practice. Fixed with local-only, glob-based counterparts
+(`find_local_mrms_files_in_range`, `find_local_glm_files_in_range`) used whenever `auto_download=False`. A
+second, unrelated pagination bug was also caught in `find_mrms_files_in_range`: an unpaginated
+`list_objects_v2` silently truncates at S3's 1000-key-per-response cap, which the ~1440-file/day NLDN product
+hits partway through a day (confirmed: a real day's listing truncated at 16:52 UTC) -- fixed with
+`s3.get_paginator`.
+
+Regenerate (from a login node -- the download step needs internet):
+
+    python scripts/download_obs.py --which nldn,glm       # every 1-min NLDN + ~20-s GLM file, full run spans
+    WHICH=lightning sbatch scripts/batch_plot.sbatch
+    python -m bnf_wrf_eval.make_movies --which lightning
+
+The one-time full run (2026-09-04): download (all 3 `rund1-dynlit` runs' full 72-h spans) 12,714 NLDN + 38,701
+GLM files, 0 failures, ~1.4 GB + ~30 GB; render (array job 1024041, 64 tasks/32 concurrent) 432/432 frames, 0
+failures, ~8 min wall time; movies 6/6, 0 failures, all frames exactly 1673x651 px (no size-mismatch padding
+needed). See `outputs/movies/README.md` for the movie inventory/filename key.

@@ -18,6 +18,7 @@ outputs/movies/*
 # Downloaded satellite/radar observation data
 goes_data/
 mrms_data/
+nalma_data/
 
 # Cached CRTM-derived WRF brightness temperature (see crtm.py) -- expensive
 # to recompute, but fully reproducible from the wrfout files, so not tracked.

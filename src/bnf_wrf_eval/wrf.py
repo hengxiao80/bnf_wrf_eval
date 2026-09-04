@@ -28,6 +28,54 @@ def get_lambert_projection(wrf_file: str | Path) -> ccrs.LambertConformal:
         )
 
 
+def read_cell_edges_xy(
+    wrf_file: str | Path, proj: ccrs.Projection
+) -> tuple[np.ndarray, np.ndarray]:
+    """WRF's exact mass-grid cell edges, in `proj`'s projected x/y
+    coordinates -- derived from the staggered U/V-point lat/lon arrays
+    (`XLONG_U`/`XLAT_U`, `XLONG_V`/`XLAT_V`) rather than approximated by
+    extrapolating outward from the mass-point (`XLONG`/`XLAT`) centers.
+
+    WRF's Arakawa-C grid staggers U points in the west_east direction and
+    V points in the south_north direction, each one point wider than the
+    mass grid in that direction (confirmed against a real wrfout: mass
+    (389, 549), U (389, 550), V (390, 549)) -- i.e. U/V points sit exactly
+    on the west_east/south_north mass-cell edges. Both `point_lon`/
+    `point_lat` and these U/V edges get projected through the *same*
+    `proj` (matching WRF's own internal Lambert formula -- see
+    `get_lambert_projection`) before any binning happens, so this is never
+    comparing raw lat/lon against a rotated grid -- everything lives in one
+    shared Lambert x/y plane.
+
+    Reduces the full 2D projected U/V arrays to one representative row
+    (for `x_edges`) and one representative column (for `y_edges`), on the
+    assumption that they're separable -- checked empirically against a
+    real wrfout: projected U-point x varies by at most ~3 m between the
+    first and last row (out of a 2500 m cell), and projected V-point y by
+    at most ~2 m between the first and last column, consistent with
+    `XLONG_U`/`XLAT_V` being stored as float32 (~1 m precision at this
+    magnitude) rather than any genuine non-uniformity -- i.e. WRF's grid
+    really is regular in its own native projection, as expected by
+    construction, and this reprojection preserves that to well under a
+    MRMS pixel's size.
+
+    Returns (x_edges, y_edges): 1D arrays of length (west_east+1) and
+    (south_north+1) respectively, e.g. for use in
+    `lightning.bin_points_to_wrf_grid`.
+    """
+    with netCDF4.Dataset(wrf_file) as nc:
+        lon_u = np.ma.filled(nc.variables["XLONG_U"][0, ...], np.nan)
+        lat_u = np.ma.filled(nc.variables["XLAT_U"][0, ...], np.nan)
+        lon_v = np.ma.filled(nc.variables["XLONG_V"][0, ...], np.nan)
+        lat_v = np.ma.filled(nc.variables["XLAT_V"][0, ...], np.nan)
+
+    u_xyz = proj.transform_points(ccrs.PlateCarree(), lon_u[0, :], lat_u[0, :])
+    v_xyz = proj.transform_points(ccrs.PlateCarree(), lon_v[:, 0], lat_v[:, 0])
+    x_edges = u_xyz[:, 0]
+    y_edges = v_xyz[:, 1]
+    return x_edges, y_edges
+
+
 def read_field(
     wrf_file: str | Path, varname: str
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, dt.datetime]:
@@ -156,6 +204,60 @@ def read_brightness_temperature_from_olr(
     """
     lon, lat, olr, valid_time = read_field(wrf_file, varname)
     return lon, lat, brightness_temperature_from_olr(olr), valid_time
+
+
+def read_dyn_lightning_flash_counts(
+    wrf_file_t1: str | Path, wrf_file_t2: str | Path
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, tuple[dt.datetime, dt.datetime]]:
+    """Per-grid-cell lightning flash counts between two wrfout times, from
+    WRF's Dynamic Lightning Scheme (`dyn_lightning_option=1`; new in WRF
+    v4.8.0; Lynn, B. H., Y. Yair, C. Price, G. Kelman, and A. Clark, 2012:
+    Predicting cloud-to-ground and intracloud lightning in weather forecast
+    models. Wea. Forecasting, 27, 1470-1486).
+
+    `LPOS`/`LNEG`/`LNEU` ("Positive/Negative Cloud to Ground Lightning
+    Density", "Intra-Cloud Lightning Density") are running totals of stroke
+    counts accumulated since the start of the simulation -- confirmed
+    against `phys/module_ltng_strokes.F`'s `flash` subroutine
+    (`lpos = lpos + int(e_p/j_pos)`, a state variable never reset) and
+    empirically (their domain sums only ever increase across a run's
+    `wrfout` files) -- not per-output-interval counts. So the number of new
+    flashes in (t1, t2] at each grid cell is the *difference* between the
+    two files' values, computed here.
+
+    Returns (lon, lat, cg_pos, cg_neg, ic, (t1, t2)); `cg_pos`/`cg_neg`/`ic`
+    share the wrfout grid shape. Callers wanting total CG use
+    `cg_pos + cg_neg`; total lightning (CG + intracloud) is
+    `cg_pos + cg_neg + ic`.
+
+    Raises KeyError if `wrf_file_t1` has no `LPOS`/`LNEG`/`LNEU` (i.e. the
+    run wasn't configured with `dyn_lightning_option=1`).
+    """
+    with netCDF4.Dataset(wrf_file_t1) as nc1, netCDF4.Dataset(wrf_file_t2) as nc2:
+        for varname in ("LPOS", "LNEG", "LNEU"):
+            if varname not in nc1.variables:
+                raise KeyError(
+                    f"{wrf_file_t1} has no {varname} -- was this run configured with "
+                    "dyn_lightning_option=1?"
+                )
+
+        def _diff(varname: str) -> np.ndarray:
+            v1 = np.ma.filled(nc1.variables[varname][0, ...], np.nan)
+            v2 = np.ma.filled(nc2.variables[varname][0, ...], np.nan)
+            return v2 - v1
+
+        cg_pos = _diff("LPOS")
+        cg_neg = _diff("LNEG")
+        ic = _diff("LNEU")
+        lon = np.ma.filled(nc1.variables["XLONG"][0, ...], np.nan)
+        lat = np.ma.filled(nc1.variables["XLAT"][0, ...], np.nan)
+        t1 = dt.datetime.strptime(
+            b"".join(nc1.variables["Times"][0, :]).decode("utf-8"), "%Y-%m-%d_%H:%M:%S"
+        )
+        t2 = dt.datetime.strptime(
+            b"".join(nc2.variables["Times"][0, :]).decode("utf-8"), "%Y-%m-%d_%H:%M:%S"
+        )
+    return lon, lat, cg_pos, cg_neg, ic, (t1, t2)
 
 
 def read_column_max_reflectivity(

@@ -80,6 +80,20 @@ D2_SCHEMES = {
     "rund2-dynlit": "500-m (D2) Thompson + dyn-lightning",
 }
 
+# Only `rund1-dynlit` has `dyn_lightning_option=1` (LPOS/LNEG/LNEU); the
+# other three `SCHEMES` entries would raise KeyError from
+# `wrf.read_dyn_lightning_flash_counts` immediately. A separate one-entry
+# schemes dict (matching the `D2_SCHEMES` pattern above) keeps the
+# "lightning_*" types from wastefully attempting -- and failing on --
+# rund1/rund1-mp52/rund1-mp53.
+DYNLIT_SCHEMES = {"rund1-dynlit": SCHEMES["rund1-dynlit"]}
+
+# Types needing a *pair* of consecutive-hour wrfout times (the difference
+# of LPOS/LNEG/LNEU between them), not a single time -- so the run's very
+# last hourly timestamp (no successor) must be excluded from the
+# worklist, unlike every other "run"-scope type.
+PAIRED_TYPES = {"lightning_cg", "lightning_total"}
+
 # type -> (scope, cadence-minutes, output-filename prefix). scope "run"
 # iterates every case x d1 scheme; "case" iterates case days only; "d2run"
 # iterates every case x d2 scheme (D2_SCHEMES).
@@ -98,11 +112,17 @@ TYPES: dict[str, tuple[str, int, str]] = {
     # Tb panels OLR-derived (no CRTM -- unlike the d1 `tb4`/`wrf_tb`).
     "d2_tb4": ("d2run", 60, "d2_olr_tb_4panel"),
     "d2_refl4": ("d2run", 60, "d2_refl_4panel"),
+    # WRF (rund1-dynlit only) vs. observed lightning, hourly-accumulated
+    # flash counts. scope "dynlit" -> DYNLIT_SCHEMES (just rund1-dynlit);
+    # `when` is each window's *start* time (see PAIRED_TYPES above).
+    "lightning_cg": ("dynlit", 60, "lightning_cg_wrf_mrms"),
+    "lightning_total": ("dynlit", 60, "lightning_total_wrf_glm"),
 }
 GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
     "d2": ["d2_tb4", "d2_refl4"],
+    "lightning": ["lightning_cg", "lightning_total"],
     "all": list(TYPES),
 }
 
@@ -172,12 +192,15 @@ def build_worklist(
         scope, cadence, prefix = TYPES[ptype]
         out_dir = frames_root / ptype
 
-        if scope in ("run", "d2run"):
-            schemes = SCHEMES if scope == "run" else D2_SCHEMES
+        if scope in ("run", "d2run", "dynlit"):
+            schemes = {"run": SCHEMES, "d2run": D2_SCHEMES, "dynlit": DYNLIT_SCHEMES}[scope]
             for case in CASES:
                 for scheme in schemes:
                     run_dir = runs_root / case / scheme
-                    for when in _wrf_times(run_dir, domain, cadence):
+                    times = _wrf_times(run_dir, domain, cadence)
+                    if ptype in PAIRED_TYPES and times:
+                        times = times[:-1]  # drop the last hour: no successor to pair with
+                    for when in times:
                         if start and when < start:
                             continue
                         if end and when > end:
@@ -265,6 +288,18 @@ def _render(item: tuple, opts: argparse.Namespace) -> None:
                 hrrr_base_dir=opts.hrrr_dir, mrms_dir=opts.mrms_dir,
                 domain=opts.domain, out_file=out_path,
                 auto_download_mrms=opts.auto_download,
+            )
+        elif ptype == "lightning_cg":
+            plotting.plot_run_lightning_cg_comparison(
+                when, DYNLIT_SCHEMES[Path(key).name], key,
+                mrms_dir=opts.mrms_dir, domain=opts.domain, out_file=out_path,
+                auto_download_mrms=opts.auto_download,
+            )
+        elif ptype == "lightning_total":
+            plotting.plot_run_lightning_total_comparison(
+                when, DYNLIT_SCHEMES[Path(key).name], key,
+                goes_dir=opts.goes_dir, domain=opts.domain, out_file=out_path,
+                auto_download_glm=opts.auto_download,
             )
         elif ptype == "hrrr_tb":
             plotting.plot_case_hrrr_tb_single(

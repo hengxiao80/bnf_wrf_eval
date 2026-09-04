@@ -39,8 +39,16 @@ GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
     "d2": ["d2_tb4", "d2_refl4"],
+    "lightning": ["lightning_cg", "lightning_total"],
 }
-GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"] + GROUPS["d2"]
+GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"] + GROUPS["d2"] + GROUPS["lightning"]
+
+# Frame types rendered on a black background (`plotting.py`'s
+# `dark_background=True` default for the lightning comparisons) --
+# `encode_movie`'s pad-to-max-size canvas must match, or a size-mismatched
+# frame (bbox_inches="tight" makes sizes vary by a few px) gets a visible
+# white bar instead of blending in.
+DARK_TYPES = {"lightning_cg", "lightning_total"}
 
 _FRAME_RE = re.compile(r"^(?P<base>.+)_(?P<stamp>\d{8}_\d{4})Z\.png$")
 
@@ -58,12 +66,12 @@ def _resolve_types(which: str) -> list[str]:
 
 def discover_movies(
     frames_root: str | Path, types: list[str], movies_dir: str | Path
-) -> list[tuple[str, list[Path], Path]]:
-    """`(name, ordered_frames, out_path)` per movie, across the given type
-    subdirs of `frames_root`. Deterministically ordered."""
+) -> list[tuple[str, list[Path], Path, str]]:
+    """`(name, ordered_frames, out_path, ptype)` per movie, across the given
+    type subdirs of `frames_root`. Deterministically ordered."""
     frames_root = Path(frames_root)
     movies_dir = Path(movies_dir)
-    movies: list[tuple[str, list[Path], Path]] = []
+    movies: list[tuple[str, list[Path], Path, str]] = []
 
     for ptype in types:
         type_dir = frames_root / ptype
@@ -77,11 +85,13 @@ def discover_movies(
             groups[m["base"]].append((m["stamp"], png))
         for base in sorted(groups):
             frames = [p for _, p in sorted(groups[base])]
-            movies.append((base, frames, movies_dir / f"{base}.mp4"))
+            movies.append((base, frames, movies_dir / f"{base}.mp4", ptype))
     return movies
 
 
-def encode_movie(frames: list[Path], out_path: Path, fps: int, log=print) -> None:
+def encode_movie(
+    frames: list[Path], out_path: Path, fps: int, bg_color: str = "white", log=print
+) -> None:
     import imageio.v2 as iio
     import numpy as np
     from PIL import Image
@@ -102,7 +112,7 @@ def encode_movie(frames: list[Path], out_path: Path, fps: int, log=print) -> Non
         for f in frames:
             im = Image.open(f).convert("RGB")
             if im.size != (max_w, max_h):
-                canvas = Image.new("RGB", (max_w, max_h), "white")
+                canvas = Image.new("RGB", (max_w, max_h), bg_color)
                 canvas.paste(im, ((max_w - im.width) // 2, (max_h - im.height) // 2))
                 im = canvas
             writer.append_data(np.asarray(im))
@@ -152,7 +162,7 @@ def main(argv: list[str] | None = None) -> int:
         movies = movies[idx::cnt]
 
     if args.list:
-        for name, frames, out_path in movies:
+        for name, frames, out_path, ptype in movies:
             print(f"{name:52s}  {len(frames):5d} frames  -> {out_path}")
         print(f"# {len(movies)} movie(s)  types={','.join(types)}")
         return 0
@@ -162,14 +172,15 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     n_ok = n_skip = n_fail = 0
-    for name, frames, out_path in movies:
+    for name, frames, out_path, ptype in movies:
         if out_path.exists() and not args.overwrite:
             print(f"SKIP  {name} ({out_path.name} exists)", flush=True)
             n_skip += 1
             continue
         print(f"MAKE  {name}  ({len(frames)} frames)", flush=True)
         try:
-            encode_movie(frames, out_path, args.fps)
+            bg_color = "black" if ptype in DARK_TYPES else "white"
+            encode_movie(frames, out_path, args.fps, bg_color=bg_color)
             n_ok += 1
         except Exception as exc:  # noqa: BLE001
             print(f"FAIL  {name}: {exc!r}", flush=True)
