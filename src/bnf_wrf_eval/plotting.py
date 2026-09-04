@@ -926,6 +926,43 @@ def plot_run_wrf_refl_single(
     )
 
 
+def plot_run_wrf_olr_tb_single(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    **kwargs,
+):
+    """Single-panel WRF OLR-derived IR-window brightness temperature for one
+    run/time.
+
+    Uses `wrf.read_brightness_temperature_from_olr` -- the broadband
+    Yang & Slingo (2001) ``OLR = sigma*Tf**4`` inversion of WRF's TOA `OLR`
+    field, the same cheap conversion the 4-panel ``wrf_panel="olr"``
+    comparison and the `tb4_simple` frames use. No forward model and no
+    `crtm_cache/`; shares the `DEFAULT_TB_CMAP` / `DEFAULT_CTT_LEVELS`
+    scale with the CRTM and `ctt` Tb panels so the series is comparable."""
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+    run_dir = Path(run_dir)
+    wrf_file = _find_wrf_file(run_dir, domain, time)
+
+    proj = wrf_reader.get_lambert_projection(wrf_file)
+    lon, lat, tb, valid_time = wrf_reader.read_brightness_temperature_from_olr(wrf_file)
+
+    out_file = kwargs.pop("out_file", None)
+    if out_file is None and output_base_dir is not None:
+        out_file = _output_path(output_base_dir, "wrf_olr_tb", run_dir, time)
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {valid_time:%Y-%m-%d %H:%M} UTC")
+    return plot_single_field(
+        lon, lat, tb, proj=proj, domain_lon=lon, domain_lat=lat,
+        levels=DEFAULT_CTT_LEVELS, cmap=DEFAULT_TB_CMAP, extend="both",
+        colorbar_label="Brightness Temp. (K)",
+        suptitle=suptitle, out_file=out_file, **kwargs,
+    )
+
+
 def plot_case_hrrr_tb_single(
     time: dt.datetime | str,
     case_label: str,

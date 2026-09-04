@@ -68,6 +68,7 @@ SCHEMES = {
     "rund1": "2.5-km (D1) Thompson",
     "rund1-mp52": "2.5-km (D1) P3 (mp=52)",
     "rund1-mp53": "2.5-km (D1) P3 (mp=53)",
+    "rund1-dynlit": "2.5-km (D1) Thompson + dyn-lightning",
 }
 REF_SCHEME = "rund1"  # subdir used for the (time-independent) domain geometry
 
@@ -79,6 +80,7 @@ TYPES: dict[str, tuple[str, int, str]] = {
     "refl3": ("run", 60, "wrf_hrrr_mrms_refl_comparison"),
     "wrf_tb": ("run", 15, "wrf_crtm_tb"),
     "wrf_refl": ("run", 15, "wrf_refl"),
+    "wrf_olr_tb": ("run", 15, "wrf_olr_tb"),
     "hrrr_tb": ("case", 60, "hrrr_tb"),
     "hrrr_refl": ("case", 60, "hrrr_refl"),
     "goes_tb": ("case", 5, "goes_tb"),
@@ -86,7 +88,7 @@ TYPES: dict[str, tuple[str, int, str]] = {
 }
 GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
-    "single": ["wrf_tb", "wrf_refl", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
+    "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
     "all": list(TYPES),
 }
 
@@ -227,6 +229,11 @@ def _render(item: tuple, opts: argparse.Namespace) -> None:
             )
         elif ptype == "wrf_refl":
             plotting.plot_run_wrf_refl_single(
+                when, SCHEMES[Path(key).name], key, domain=opts.domain,
+                out_file=out_path,
+            )
+        elif ptype == "wrf_olr_tb":
+            plotting.plot_run_wrf_olr_tb_single(
                 when, SCHEMES[Path(key).name], key, domain=opts.domain,
                 out_file=out_path,
             )

@@ -4,7 +4,7 @@ Animated comparisons of the WRF LASSO BNF test runs (Satoshi's `hrrr3` d1 (2.5-k
 analyses that drove them and against independent satellite / radar observations,
 for the DOE ARM Bankhead National Forest (BNF) site in northern Alabama.
 
-All 57 movies are H.264 (`yuv420p`), **12 fps, no audio**. At 12 fps an hourly
+All 72 movies are H.264 (`yuv420p`), **12 fps, no audio**. At 12 fps an hourly
 (73-frame) movie runs ~6 s, a 15-min (289-frame) movie ~24 s, and the 5-min GOES
 movies (~865 frames) ~72 s.
 
@@ -28,6 +28,15 @@ Each case was run with three microphysics schemes (everything else identical):
 | `rund1-mp52`  | 52 | P3 (1 ice category) |
 | `rund1-mp53`  | 53 | P3 (2 ice categories) |
 
+A fourth run per case, `rund1-dynlit`, is identical to `rund1` (Thompson,
+`mp_physics=28`) but with WRF's dynamics-based lightning-threat diagnostic
+enabled (`dyn_lightning_option=1`, `lightning_option=0`). That diagnostic is
+passive — it does not feed back into microphysics or radiation — so its
+brightness-temperature and reflectivity fields are essentially identical to
+`rund1`; the point of evaluating it is to confirm that. Only the two cheap
+`wrfout`-derived single-panel series (`wrf_olr_tb`, `wrf_refl`) were produced
+for `rund1-dynlit`; it has no CRTM Tb and no comparison movies.
+
 ## Reference data
 
 - **GOES**: GOES-19 ABI channel 13 (10.3 µm "clean window" IR) brightness
@@ -50,7 +59,9 @@ Each case was run with three microphysics schemes (everything else identical):
   WRF's top-of-atmosphere `OLR` field (the same conversion PyFLEXTRKR uses). No
   forward model — a cheap alternative to the CRTM panel. Being a column-integrated
   flux it runs slightly warm relative to a true window channel and smooths out the
-  coldest convective cloud tops.
+  coldest convective cloud tops. Also produced as a stand-alone single-panel
+  series (`wrf_olr_tb`) for every run, on the same 180–315 K Tb colour scale as
+  the CRTM and `ctt` panels.
 - **WRF reflectivity**: column maximum of the simulated `REFL_10CM` field (dBZ),
   directly comparable to the HRRR and MRMS composite reflectivity.
 
@@ -78,18 +89,22 @@ across all frames so the animations do not flicker:
 
 9 of each of the three (3 cases × 3 runs).
 
-### Single-panel movies — 30 files
+### Single-panel movies — 45 files
 
 One field per frame, at its native cadence.
 
 | File pattern | Field | Cadence / frames | Count |
 |--------------|-------|------------------|-------|
 | `wrf_crtm_tb_<case>_<run>.mp4` | WRF CRTM ABI ch.13 Tb | 15 min / 289 | 9 |
-| `wrf_refl_<case>_<run>.mp4` | WRF column-max reflectivity | 15 min / 289 | 9 |
+| `wrf_refl_<case>_<run>.mp4` | WRF column-max reflectivity | 15 min / 289 | 12 |
+| `wrf_olr_tb_<case>_<run>.mp4` | WRF OLR-fit brightness temperature | 15 min / 289 | 12 |
 | `hrrr_tb_<case>.mp4` | HRRR CRTM Tb (`SBT114`) | hourly / 73 | 3 |
 | `hrrr_refl_<case>.mp4` | HRRR composite reflectivity (`refc`) | hourly / 73 | 3 |
 | `goes_tb_<case>.mp4` | GOES-19 ABI ch.13 Tb | ~5 min / ~865 | 3 |
 | `mrms_refl_<case>.mp4` | MRMS composite reflectivity | 15 min / 289 | 3 |
+
+`wrf_refl` and `wrf_olr_tb` have 12 files each: `rund1` / `rund1-mp52` /
+`rund1-mp53` / `rund1-dynlit` × 3 cases. `wrf_crtm_tb` has 9 (no `rund1-dynlit`).
 
 The observation-only single-panel movies (`hrrr_*`, `goes_tb`, `mrms_refl`) depend
 only on the case, not on the microphysics run, so their filenames have no run tag.
@@ -101,5 +116,6 @@ labelled 20:02 is the scan nearest the requested 20:00).
     <type>_<case>lassobnfwrfhrrr3[_<run>].mp4
 
 - `<case>` — `20250502`, `20250520`, or `20250917` (see table above)
-- `<run>` — `rund1`, `rund1-mp52`, or `rund1-mp53` (comparison and WRF
-  single-panel movies only)
+- `<run>` — `rund1`, `rund1-mp52`, `rund1-mp53`, or `rund1-dynlit` (WRF
+  single-panel movies; comparison movies are `rund1` / `rund1-mp52` /
+  `rund1-mp53` only, and `rund1-dynlit` has only `wrf_olr_tb` / `wrf_refl`)

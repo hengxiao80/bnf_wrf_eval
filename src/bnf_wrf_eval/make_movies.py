@@ -37,7 +37,7 @@ DEFAULT_FPS = 12
 
 GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
-    "single": ["wrf_tb", "wrf_refl", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
+    "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
 }
 GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"]
 

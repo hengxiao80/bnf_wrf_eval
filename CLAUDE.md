@@ -243,8 +243,11 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   - `batch_plot.py` -- frame-render driver for the "plots and movies" batch (see the "Plots and movies" note
     below). Enumerates a deterministic `(plot_type, run|case, time)` work list, slices it `[idx::count]` for a
     SLURM job array (strided), skips frames already on disk (restartable), retries per-frame exceptions. Renders
-    both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`) and the six single-panel series (`wrf_tb`, `wrf_refl`,
-    `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`) into `<output-root>/frames/<type>/`. Run as
+    both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`) and the seven single-panel series (`wrf_tb`,
+    `wrf_refl`, `wrf_olr_tb`, `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`) into `<output-root>/frames/<type>/`.
+    `wrf_olr_tb` (WRF's OLR-fit Tb, `wrf.read_brightness_temperature_from_olr`, on the shared Tb colour scale) is
+    the single-panel counterpart of the `tb4_simple` top-left panel; like `wrf_refl` it reads one `wrfout` field
+    and needs no CRTM cache. Run as
     `python -m bnf_wrf_eval.batch_plot --which comparison|single|all|<types>`; `scripts/batch_plot.sbatch` is the
     64-task array. **The observation files must be local already** (`scripts/download_obs.py`): `batch_plot`
     resolves them via `find_local_*_file` and never calls S3 on the compute node.
@@ -334,6 +337,13 @@ Batch-rendered plot frames and the movies made from them, for the 9 d1 HRRR3 run
 output). Driven by `bnf_wrf_eval.batch_plot` (frames) and `bnf_wrf_eval.make_movies` (MP4s); see those modules'
 bullets under "Structure". Task prompt: `prompts/plots_and_movies.md`.
 
+A fourth run per case, `rund1-dynlit` (identical to `rund1` -- Thompson, `mp_physics=28` -- but with WRF's
+passive dynamics-based lightning-threat diagnostic on, `dyn_lightning_option=1`), was added later
+(2026-09-03) with only the two cheap `wrfout`-derived single-panel series, `wrf_olr_tb` and `wrf_refl` (no
+CRTM Tb, no comparison frames). That same batch also produced the new `wrf_olr_tb` single-panel series for all
+9 original runs. `WHICH=wrf_olr_tb,wrf_refl` array job 1023948, 4335 frames, 0 failures, ~10 min, followed by
+15 movies (`wrf_olr_tb` x 12 runs + `wrf_refl` x 3 dynlit runs).
+
 Two families:
 
 - **Hourly comparison** (HRRR analyses are hourly, so these use on-the-hour WRF/GOES/MRMS): `tb4` = the 2x2
@@ -343,12 +353,14 @@ Two families:
   selected via `plot_run_tb_comparison_4panel(..., wrf_panel="olr")` and written under the
   `wrf_simple_tb_crtm_hrrr_goes_tb_comparison` prefix so it never overwrites the `ctt` `tb4` frames; `refl3` =
   the 3-panel `plot_run_refl_comparison` (WRF | HRRR | MRMS). 73 frames/run each -> 9 movies each (27 total).
-- **Single-panel**, one field per frame at its native cadence: `wrf_tb` (WRF CRTM Tb) and `wrf_refl` (WRF
-  column-max reflectivity) at 15 min per run (289 frames -> 9 movies each); `hrrr_tb` / `hrrr_refl` hourly per
-  case (73 frames -> 3 movies each); `goes_tb` at GOES CONUS 5 min per case (~865 frames -> 3 movies);
-  `mrms_refl` at 15 min per case (289 frames -> 3 movies). 30 single-panel movies.
+- **Single-panel**, one field per frame at its native cadence: `wrf_tb` (WRF CRTM Tb, 9 runs -> 9 movies),
+  `wrf_refl` (WRF column-max reflectivity) and `wrf_olr_tb` (WRF OLR-fit Tb, same conversion as the
+  `tb4_simple` panel, on the shared Tb colour scale) at 15 min per run (289 frames; 12 runs incl. `rund1-dynlit`
+  -> 12 movies each); `hrrr_tb` / `hrrr_refl` hourly per case (73 frames -> 3 movies each); `goes_tb` at GOES
+  CONUS 5 min per case (~865 frames -> 3 movies); `mrms_refl` at 15 min per case (289 frames -> 3 movies). 45
+  single-panel movies.
 
-57 movies total, H.264 12 fps, in `outputs/movies/<frame-prefix>.mp4`; frames in `outputs/frames/<type>/`.
+72 movies total, H.264 12 fps, in `outputs/movies/<frame-prefix>.mp4`; frames in `outputs/frames/<type>/`.
 
 Regenerate (from a login node -- the download step needs internet, see the compute-node note under `plotting.py`):
 
