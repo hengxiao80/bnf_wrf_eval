@@ -53,6 +53,34 @@ files themselves (`auto_download_mrms`/`auto_download_goes` control whether miss
 downloaded automatically or raise). See the docstrings in `src/bnf_wrf_eval/plotting.py` for the full parameter
 list and file-layout conventions each one expects.
 
+### d2 (500-m ndown run) 4-panel comparisons
+
+A separate 2x2 comparison family for the 500-m runs nested into d1 via `ndown` (the `rund2` / `rund2-dynlit`
+subdirs of the three `*hrrr3` case directories; written as `wrfout_d01_*`, `max_dom=1`, so `domain="d01"`
+addresses them). Layout: **d2 (500 m) | d1 (2.5 km) on top, HRRR | independent observation below**, all on the
+d2 domain's Lambert projection (identical to d1's) and the d2 footprint padded by `domain_pad_deg` (default
+0.5, same as the d1 plots); d1 / HRRR / obs are cropped to that extent so every panel covers the same area as
+the d2 panel, with the **d2 domain outlined in red** and the BNF site starred on all four panels.
+
+- `plotting.plot_d2_tb_comparison_4panel` / `plot_run_d2_tb_comparison_4panel` -- brightness temperature.
+- `plotting.plot_d2_refl_comparison_4panel` / `plot_run_d2_refl_comparison_4panel` -- column-max reflectivity
+  (WRF `REFL_10CM` | HRRR `refc` | MRMS `MergedReflectivityQCComposite` -- same three dBZ quantities as
+  `plot_refl_comparison`).
+
+**IMPORTANT -- these Tb plots differ methodologically from the d1 `tb4` / `wrf_tb` plots.** The d2 Tb comparison
+uses the cheap **OLR-derived brightness temperature for *all three* model panels** (d2, d1, *and* HRRR:
+`wrf.read_brightness_temperature_from_olr` / `hrrr.read_brightness_temperature_from_olr`, the Yang & Slingo 2001
+`OLR = sigma*Tf**4` fit), with GOES the only observed panel. No CRTM and no `crtm_cache/` are involved. This is
+deliberate (chosen by the user) and is *not* what the d1 comparisons do -- those use CRTM-derived Tb for WRF
+(`crtm.read_simulated_brightness_temperature`) against HRRR's own CRTM-derived `SBT114`. A CRTM-derived d2 WRF
+Tb series (to plot against HRRR `SBT114` the same way d1 does) may be produced later; if/when that happens it
+should be a *new* plot type alongside these OLR ones, not a replacement. The d2 `plot_run_d2_tb_*` wrappers
+resolve the d1 panel's run automatically (`rund2` -> `rund1`, `rund2-dynlit` -> `rund1-dynlit`, same case
+directory; `plotting._D2_TO_D1_RUN`), or take an explicit `d1_run_dir=`.
+
+Batch-rendered via `bnf_wrf_eval.batch_plot` types `d2_tb4` / `d2_refl4` (group `d2`, scope `d2run`), hourly
+(HRRR's cadence, so all four panels stay time-consistent). Task prompt: `prompts/d2_plots.md`.
+
 ## Environment and commands
 
 Package management is via `uv` (build backend `uv_build`, package layout under `src/`).
@@ -243,8 +271,11 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   - `batch_plot.py` -- frame-render driver for the "plots and movies" batch (see the "Plots and movies" note
     below). Enumerates a deterministic `(plot_type, run|case, time)` work list, slices it `[idx::count]` for a
     SLURM job array (strided), skips frames already on disk (restartable), retries per-frame exceptions. Renders
-    both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`) and the seven single-panel series (`wrf_tb`,
-    `wrf_refl`, `wrf_olr_tb`, `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`) into `<output-root>/frames/<type>/`.
+    both the hourly comparison frames (`tb4`, `tb4_simple`, `refl3`), the seven single-panel series (`wrf_tb`,
+    `wrf_refl`, `wrf_olr_tb`, `hrrr_tb`, `hrrr_refl`, `goes_tb`, `mrms_refl`), and the two d2 (500-m) hourly
+    4-panel comparisons (`d2_tb4`, `d2_refl4`; group `d2`, scope `d2run`, iterating `D2_SCHEMES` = `rund2` /
+    `rund2-dynlit` x the three `*hrrr3` cases -- see "d2 (500-m ndown run) 4-panel comparisons" above) into
+    `<output-root>/frames/<type>/`.
     `wrf_olr_tb` (WRF's OLR-fit Tb, `wrf.read_brightness_temperature_from_olr`, on the shared Tb colour scale) is
     the single-panel counterpart of the `tb4_simple` top-left panel; like `wrf_refl` it reads one `wrfout` field
     and needs no CRTM cache. Run as
@@ -256,7 +287,10 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
     white to the group's max width/height (no rescale -- `bbox_inches="tight"` makes frame sizes vary by a few
     px), and encodes H.264 (`yuv420p`, 12 fps) via `imageio` + `imageio-ffmpeg`'s bundled static ffmpeg (there is
     no system `ffmpeg` here). Run as `python -m bnf_wrf_eval.make_movies --which comparison|single|all`.
-  - `plotting.py` -- the comparison plots described above, plus shared helpers (`_plot_panel`, `_plot_row`,
+  - `plotting.py` -- the comparison plots described above (the d1 3-panel / 4-panel families *and* the d2
+    `plot_d2_*_comparison_4panel` / `plot_run_d2_*_comparison_4panel` pair -- see "d2 (500-m ndown run) 4-panel
+    comparisons" above, and note that d2's Tb plots are OLR-derived for every model panel, unlike d1's
+    CRTM-based ones), plus shared helpers (`_plot_panel`, `_plot_row`,
     `_crop_to_extent`, `_domain_outline`, BNF site marker, etc.). `_plot_row` takes a flat list of axes, so it
     works for both the 3-panel row layouts and the 4-panel 2x2 grid (pass `axes.flatten()`). Cartopy `GeoAxes`
     force an equal-area aspect after `set_extent`, so a `figsize` whose aspect doesn't match the domain's actual
@@ -316,8 +350,9 @@ against the marketplace -- we hit this once with a ~10-month-stale Jupyter exten
   provenance (e.g. `CRTM_refinement*.md`, `first_comparision_plot.md`, `p8w.md` -- the WRF `p8w` interface-
   pressure formulation used to rewrite `crtm.py`'s `_layer_pressures`; `precalc_crtm.md` -- the ask that led to
   `crtm_precompute.py` and the calibration/pre-compute sbatch scripts; `plots_and_movies.md` -- the ask that led
-  to `batch_plot.py` / `make_movies.py` / `download_obs.py` and the "Plots and movies" note below). Not used by
-  any code.
+  to `batch_plot.py` / `make_movies.py` / `download_obs.py` and the "Plots and movies" note below;
+  `d2_plots.md` -- the ask that led to the d2 (500-m) 4-panel comparisons and `batch_plot`'s `d2_tb4` /
+  `d2_refl4` types). Not used by any code.
 - `outputs/`, `goes_data/`, `mrms_data/`, `crtm_cache/` -- generated PNGs / downloaded observation files / cached
   CRTM-derived WRF brightness temperature (see `crtm.py`), gitignored. `crtm_cache/` is currently fully
   populated (~6.5 GB) with all 2601 15-min snapshots of the 9 d1 HRRR3 runs, cache-key version `2026-08-29a` --

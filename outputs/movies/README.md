@@ -1,12 +1,15 @@
 # BNF WRF evaluation movies
 
-Animated comparisons of the WRF LASSO BNF test runs (Satoshi's `hrrr3` d1 (2.5-km) runs) against the HRRR
-analyses that drove them and against independent satellite / radar observations,
-for the DOE ARM Bankhead National Forest (BNF) site in northern Alabama.
+Animated comparisons of the WRF LASSO BNF test runs (Satoshi's `hrrr3` runs — the
+d1 (2.5-km) runs and the d2 (500-m) runs nested into them via `ndown`) against the
+HRRR analyses that drove them and against independent satellite / radar
+observations, for the DOE ARM Bankhead National Forest (BNF) site in northern
+Alabama.
 
-All 72 movies are H.264 (`yuv420p`), **12 fps, no audio**. At 12 fps an hourly
-(73-frame) movie runs ~6 s, a 15-min (289-frame) movie ~24 s, and the 5-min GOES
-movies (~865 frames) ~72 s.
+All 84 movies (72 d1 + 12 d2) are H.264 (`yuv420p`), **12 fps, no audio**. At
+12 fps an hourly (73-frame) movie runs ~6 s, a 15-min (289-frame) movie ~24 s, and
+the 5-min GOES movies (~865 frames) ~72 s. The d2 comparison movies are hourly and
+shorter (15–24 frames — those runs cover only 14–23 h; see below).
 
 ## The runs
 
@@ -37,6 +40,27 @@ brightness-temperature and reflectivity fields are essentially identical to
 `wrfout`-derived single-panel series (`wrf_olr_tb`, `wrf_refl`) were produced
 for `rund1-dynlit`; it has no CRTM Tb and no comparison movies.
 
+### d2 (500-m) runs
+
+Each case also has one or more **500-m runs** nested into the d1 domain with WRF's
+`ndown` one-way nesting (the ndown output domain is written as `wrfout_d01_*`, so
+these too are single-domain from the plotting side). The movies here cover two per
+case:
+
+| Run tag        | `mp_physics` | Notes |
+|----------------|--------------|-------|
+| `rund2`        | 28 | Thompson aerosol-aware, 500 m |
+| `rund2-dynlit` | 28 | as `rund2` + passive dynamics-based lightning-threat diagnostic (`dyn_lightning_option=1`); Tb / reflectivity essentially identical to `rund2` |
+
+Unlike the 72-hour d1 runs, these d2 runs cover only part of each case period
+(roughly its convective window):
+
+| Case | d2 period (UTC) | hourly frames |
+|------|-----------------|---------------|
+| `20250502` | 05-02 07Z – 05-03 06Z | 24 |
+| `20250520` | 05-20 12Z – 05-21 05Z | 18 |
+| `20250917` | 09-17 10Z – 09-18 00Z | 15 |
+
 ## Reference data
 
 - **GOES**: GOES-19 ABI channel 13 (10.3 µm "clean window" IR) brightness
@@ -61,7 +85,11 @@ for `rund1-dynlit`; it has no CRTM Tb and no comparison movies.
   flux it runs slightly warm relative to a true window channel and smooths out the
   coldest convective cloud tops. Also produced as a stand-alone single-panel
   series (`wrf_olr_tb`) for every run, on the same 180–315 K Tb colour scale as
-  the CRTM and `ctt` panels.
+  the CRTM and `ctt` panels. **The d2 comparison movies use this OLR-fit Tb for
+  every model panel — d2, d1 *and* HRRR** (`hrrr.read_brightness_temperature_from_olr`,
+  the same conversion applied to HRRR's `OLR`) — so no CRTM is involved there. This
+  differs from the d1 `*_tb_comparison` movies, which use CRTM-derived Tb for WRF
+  against HRRR's own CRTM `SBT114`.
 - **WRF reflectivity**: column maximum of the simulated `REFL_10CM` field (dBZ),
   directly comparable to the HRRR and MRMS composite reflectivity.
 
@@ -69,8 +97,11 @@ for `rund1-dynlit`; it has no CRTM Tb and no comparison movies.
 
 Every panel is reprojected onto the **same** Lambert Conformal projection and map
 extent (taken from the WRF domain), with the WRF domain footprint outlined in
-**red** and the BNF site marked with a **red star**. Colour scales are fixed
-across all frames so the animations do not flicker:
+**red** and the BNF site marked with a **red star**. For the d1 movies the
+projection / extent / red outline are the 2.5-km domain's; for the **d2 movies**
+they are the **500-m domain's** (its footprint padded slightly), so the d1 panel
+there shows the 2.5-km run subset to the d2 area. Colour scales are fixed across
+all frames so the animations do not flicker:
 
 - Brightness temperature: 180–315 K, 5-K steps, conventional IR enhancement
   (grayscale for 240–315 K, then a cyan-to-magenta rainbow for the coldest
@@ -111,11 +142,26 @@ only on the case, not on the microphysics run, so their filenames have no run ta
 Their suptitle carries the field's *actual* valid/scan time (e.g. a GOES frame
 labelled 20:02 is the scan nearest the requested 20:00).
 
+### d2 (500-m) comparison movies (hourly, 15–24 frames each) — 12 files
+
+2×2 layout: **d2 (500 m WRF) | d1 (2.5 km WRF)** on top, **HRRR | independent
+observation** below. All on the d2 domain's projection / extent, d2 footprint
+outlined in red, BNF star on every panel.
+
+| File pattern | Layout |
+|--------------|--------|
+| `d2_olr_tb_4panel_<case>_<run>.mp4` | Brightness temperature, **OLR-fit for all three model panels** (d2 \| d1 \| HRRR), GOES observed bottom-right — no CRTM |
+| `d2_refl_4panel_<case>_<run>.mp4` | Reflectivity: WRF d2 column-max \| WRF d1 column-max \| HRRR `refc` \| MRMS composite |
+
+6 of each (3 cases × `rund2` / `rund2-dynlit`). Frame counts per case: 24
+(`20250502`), 18 (`20250520`), 15 (`20250917`).
+
 ## Filename key
 
     <type>_<case>lassobnfwrfhrrr3[_<run>].mp4
 
-- `<case>` — `20250502`, `20250520`, or `20250917` (see table above)
-- `<run>` — `rund1`, `rund1-mp52`, `rund1-mp53`, or `rund1-dynlit` (WRF
-  single-panel movies; comparison movies are `rund1` / `rund1-mp52` /
-  `rund1-mp53` only, and `rund1-dynlit` has only `wrf_olr_tb` / `wrf_refl`)
+- `<case>` — `20250502`, `20250520`, or `20250917` (see tables above)
+- `<run>` — for the d1 movies: `rund1`, `rund1-mp52`, `rund1-mp53`, or
+  `rund1-dynlit` (WRF single-panel movies; d1 comparison movies are `rund1` /
+  `rund1-mp52` / `rund1-mp53` only, and `rund1-dynlit` has only `wrf_olr_tb` /
+  `wrf_refl`). For the `d2_*_4panel` movies: `rund2` or `rund2-dynlit`.

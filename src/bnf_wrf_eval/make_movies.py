@@ -38,8 +38,9 @@ DEFAULT_FPS = 12
 GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
+    "d2": ["d2_tb4", "d2_refl4"],
 }
-GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"]
+GROUPS["all"] = GROUPS["comparison"] + GROUPS["single"] + GROUPS["d2"]
 
 _FRAME_RE = re.compile(r"^(?P<base>.+)_(?P<stamp>\d{8}_\d{4})Z\.png$")
 

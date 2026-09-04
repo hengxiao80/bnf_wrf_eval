@@ -759,6 +759,281 @@ def plot_run_tb_comparison_4panel(
 
 
 # ---------------------------------------------------------------------------
+# d2 (500-m ndown) 4-panel comparisons
+#
+# One frame per output time, laid out as a 2x2 grid:
+#
+#     d2 (500 m, WRF)   |   d1 (2.5 km, WRF)
+#     HRRR              |   independent observation
+#
+# All four panels are drawn on the d2 domain's Lambert projection and the
+# same map extent -- the d2 footprint padded by `domain_pad_deg` (so the d2
+# panel shows a small margin around its own grid, like the WRF panel in the
+# d1 comparisons) -- with d1 / HRRR / obs cropped to that extent so every
+# panel covers the same area as the d2 panel. The d2 domain's footprint is
+# outlined in red and the BNF site marked with a red star on every panel
+# (both handled by `_plot_row` -> `_plot_panel`).
+#
+# Brightness temperature uses WRF's / HRRR's cheap OLR-derived Tb
+# (`*.read_brightness_temperature_from_olr`, the Yang & Slingo 2001
+# `OLR = sigma*Tf**4` fit) for all three model panels, so no CRTM /
+# `crtm_cache/` is involved; reflectivity uses column-max `REFL_10CM` (WRF)
+# / `refc` (HRRR) / `MergedReflectivityQCComposite` (MRMS), the same three
+# quantities `plot_refl_comparison` compares.
+# ---------------------------------------------------------------------------
+
+# d2 ndown run subdir -> its d1 (2.5-km parent) counterpart in the same case
+# directory. The d1 panel reads this run's `wrfout_d01_*` (the 2.5-km outer
+# domain, which fully contains d2 and shares its exact Lambert projection).
+_D2_TO_D1_RUN = {
+    "rund2": "rund1",
+    "rund2-dynlit": "rund1-dynlit",
+}
+
+
+def _d2_four_panel(
+    fig,
+    axes,
+    proj,
+    d2_lon,
+    d2_lat,
+    d2_val,
+    d2_title,
+    d1_panel,
+    hrrr_panel,
+    obs_panel,
+    levels,
+    cmap,
+    domain_pad_deg,
+    extend,
+    colorbar_label,
+):
+    """Shared body of the two `plot_d2_*_comparison_4panel` plotters: given
+    the four already-read (lon, lat, values, title) panels, crop d1 / HRRR /
+    obs to the padded d2 extent and draw the 2x2 grid with one shared
+    colorbar, the d2 outline in red, and the BNF marker on every panel."""
+    extent = _domain_extent(d2_lon, d2_lat, domain_pad_deg)
+    domain_outline = _domain_outline(d2_lon, d2_lat)
+
+    d1_lon, d1_lat, d1_val, d1_title = d1_panel
+    hrrr_lon, hrrr_lat, hrrr_val, hrrr_title = hrrr_panel
+    obs_lon, obs_lat, obs_val, obs_title = obs_panel
+    d1_lon, d1_lat, d1_val = _crop_to_extent(d1_lon, d1_lat, d1_val, extent)
+    hrrr_lon, hrrr_lat, hrrr_val = _crop_to_extent(hrrr_lon, hrrr_lat, hrrr_val, extent)
+    obs_lon, obs_lat, obs_val = _crop_to_extent(obs_lon, obs_lat, obs_val, extent)
+
+    _plot_row(
+        fig, axes.flatten(),
+        [
+            (d2_lon, d2_lat, d2_val, d2_title),
+            (d1_lon, d1_lat, d1_val, d1_title),
+            (hrrr_lon, hrrr_lat, hrrr_val, hrrr_title),
+            (obs_lon, obs_lat, obs_val, obs_title),
+        ],
+        levels, cmap, extent, domain_outline, extend=extend, colorbar_label=colorbar_label,
+    )
+
+
+def plot_d2_tb_comparison_4panel(
+    d2_file: str | Path,
+    d1_file: str | Path,
+    hrrr_file: str | Path,
+    goes_file: str | Path,
+    ctt_levels: np.ndarray = DEFAULT_CTT_LEVELS,
+    cmap: str | Colormap = DEFAULT_TB_CMAP,
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (12.6, 7.9),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """2x2 OLR-derived brightness-temperature comparison for a 500-m ndown
+    run: d2 (500 m WRF) | d1 (2.5 km WRF) on top, HRRR | GOES ABI ch.13
+    (observed) below.
+
+    The three model panels all use the cheap OLR-fit Tb
+    (`wrf.read_brightness_temperature_from_olr` /
+    `hrrr.read_brightness_temperature_from_olr`) -- no CRTM. GOES is the
+    real observed channel-13 (10.3 micron) brightness temperature.
+
+    See the module comment above "d2 (500-m ndown) 4-panel comparisons" for
+    the projection / extent / outline / BNF-marker conventions; parameters
+    otherwise mirror `plot_tb_comparison_4panel`.
+    """
+    d2_lon, d2_lat, d2_tb, _ = wrf_reader.read_brightness_temperature_from_olr(d2_file)
+    d1_lon, d1_lat, d1_tb, _ = wrf_reader.read_brightness_temperature_from_olr(d1_file)
+    hrrr_lon, hrrr_lat, hrrr_tb, _ = hrrr_reader.read_brightness_temperature_from_olr(hrrr_file)
+    goes_lon, goes_lat, goes_tb, goes_time = goes_reader.read_brightness_temperature(goes_file)
+    proj = wrf_reader.get_lambert_projection(d2_file)
+
+    fig, axes = plt.subplots(
+        2, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+
+    _d2_four_panel(
+        fig, axes, proj,
+        d2_lon, d2_lat, d2_tb, "d2 (500 m) WRF OLR brightness temp. (K)",
+        (d1_lon, d1_lat, d1_tb, "d1 (2.5 km) WRF OLR brightness temp. (K)"),
+        (hrrr_lon, hrrr_lat, hrrr_tb, "HRRR OLR brightness temp. (K)"),
+        (
+            goes_lon, goes_lat, goes_tb,
+            f"GOES ABI ch.13 brightness temp. (K)\n{goes_time:%Y-%m-%d %H:%M} UTC scan",
+        ),
+        ctt_levels, cmap, domain_pad_deg, "both", "K",
+    )
+
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=16, fontweight="bold")
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def plot_d2_refl_comparison_4panel(
+    d2_file: str | Path,
+    d1_file: str | Path,
+    hrrr_file: str | Path,
+    mrms_file: str | Path,
+    refl_levels: np.ndarray = DEFAULT_REFL_LEVELS,
+    refl_cmap: str = "turbo",
+    domain_pad_deg: float = 0.5,
+    figsize: tuple[float, float] = (12.6, 7.9),
+    suptitle: str | None = None,
+    out_file: str | Path | None = None,
+):
+    """2x2 column-max radar-reflectivity comparison for a 500-m ndown run:
+    d2 (500 m WRF) | d1 (2.5 km WRF) on top, HRRR (`refc`) | MRMS
+    (`MergedReflectivityQCComposite`, observed) below.
+
+    All four are the same physical quantity (dBZ), a direct apples-to-apples
+    comparison -- see `plot_refl_comparison`. Projection / extent / outline /
+    BNF-marker conventions are described in the module comment above.
+    """
+    d2_lon, d2_lat, d2_refl, _ = wrf_reader.read_column_max_reflectivity(d2_file)
+    d1_lon, d1_lat, d1_refl, _ = wrf_reader.read_column_max_reflectivity(d1_file)
+    hrrr_lon, hrrr_lat, hrrr_refl, _ = hrrr_reader.read_composite_reflectivity(hrrr_file)
+    mrms_lon, mrms_lat, mrms_refl, mrms_time = mrms_reader.read_composite_reflectivity(mrms_file)
+    proj = wrf_reader.get_lambert_projection(d2_file)
+
+    fig, axes = plt.subplots(
+        2, 2, figsize=figsize, subplot_kw={"projection": proj}, constrained_layout=True
+    )
+    fig.get_layout_engine().set(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+
+    _d2_four_panel(
+        fig, axes, proj,
+        d2_lon, d2_lat, d2_refl, "d2 (500 m) WRF max reflectivity (dBZ)",
+        (d1_lon, d1_lat, d1_refl, "d1 (2.5 km) WRF max reflectivity (dBZ)"),
+        (hrrr_lon, hrrr_lat, hrrr_refl, "HRRR composite reflectivity (dBZ)"),
+        (
+            mrms_lon, mrms_lat, mrms_refl,
+            f"MRMS composite reflectivity (dBZ)\n{mrms_time:%Y-%m-%d %H:%M} UTC",
+        ),
+        refl_levels, refl_cmap, domain_pad_deg, "max", "dBZ",
+    )
+
+    if suptitle is not None:
+        fig.suptitle(suptitle, fontsize=16, fontweight="bold")
+    if out_file is not None:
+        fig.savefig(out_file, dpi=150, bbox_inches="tight")
+    return fig
+
+
+def _resolve_d1_run_dir(d2_run_dir: Path, d1_run_dir: str | Path | None) -> Path:
+    if d1_run_dir is not None:
+        return Path(d1_run_dir)
+    try:
+        return d2_run_dir.parent / _D2_TO_D1_RUN[d2_run_dir.name]
+    except KeyError:
+        raise ValueError(
+            f"no known d1 counterpart for d2 run {d2_run_dir.name!r}; "
+            f"pass d1_run_dir= explicitly (known: {sorted(_D2_TO_D1_RUN)})"
+        ) from None
+
+
+def plot_run_d2_tb_comparison_4panel(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    d1_run_dir: str | Path | None = None,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    goes_dir: str | Path = "goes_data",
+    channel: int = 13,
+    satellite: str = goes_reader.DEFAULT_SATELLITE,
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_goes: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_d2_tb_comparison_4panel` that takes a time plus a
+    500-m ndown run's name/directory and locates the matching d2 wrfout, the
+    d1 (2.5-km parent) wrfout, and the HRRR / GOES files itself.
+
+    `run_dir` is the d2 run (e.g.
+    `satoshi_testruns/20250917lassobnfwrfhrrr3/rund2`); the d1 panel comes
+    from `d1_run_dir`, defaulting to the same case directory's `rund1` (for
+    `rund2`) or `rund1-dynlit` (for `rund2-dynlit`). Both the d2 and d1
+    runs write the domain as `wrfout_d01_*`, so `domain` applies to both.
+
+    Saved filenames use the `d2_olr_tb_4panel` prefix. Other parameters
+    mirror `plot_run_tb_comparison_4panel`.
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    d1_dir = _resolve_d1_run_dir(run_dir, d1_run_dir)
+    d2_file = _find_wrf_file(run_dir, domain, time)
+    d1_file = _find_wrf_file(d1_dir, domain, time)
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+    goes_file = _resolve_goes_file(time, goes_dir, channel, satellite, auto_download_goes)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(output_base_dir, "d2_olr_tb_4panel", run_dir, time)
+
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
+    return plot_d2_tb_comparison_4panel(
+        d2_file, d1_file, hrrr_file, goes_file, suptitle=suptitle, **kwargs
+    )
+
+
+def plot_run_d2_refl_comparison_4panel(
+    time: dt.datetime | str,
+    run_name: str,
+    run_dir: str | Path,
+    d1_run_dir: str | Path | None = None,
+    hrrr_base_dir: str | Path = "satoshi_forcing_data/hrrr/hrrrnat_data",
+    mrms_dir: str | Path = "mrms_data",
+    domain: str = "d01",
+    output_base_dir: str | Path | None = None,
+    auto_download_mrms: bool = False,
+    **kwargs,
+):
+    """Wrapper around `plot_d2_refl_comparison_4panel`; the reflectivity
+    counterpart of `plot_run_d2_tb_comparison_4panel` -- see there for the
+    d1-counterpart resolution and the file-layout conventions. Saved
+    filenames use the `d2_refl_4panel` prefix.
+    """
+    if isinstance(time, str):
+        time = dt.datetime.fromisoformat(time)
+
+    run_dir = Path(run_dir)
+    d1_dir = _resolve_d1_run_dir(run_dir, d1_run_dir)
+    d2_file = _find_wrf_file(run_dir, domain, time)
+    d1_file = _find_wrf_file(d1_dir, domain, time)
+    hrrr_file = _find_hrrr_file(hrrr_base_dir, time)
+    mrms_file = _resolve_mrms_file(time, mrms_dir, auto_download_mrms)
+
+    if output_base_dir is not None and "out_file" not in kwargs:
+        kwargs["out_file"] = _output_path(output_base_dir, "d2_refl_4panel", run_dir, time)
+
+    suptitle = kwargs.pop("suptitle", f"{run_name} -- {time:%Y-%m-%d %H:%M} UTC")
+    return plot_d2_refl_comparison_4panel(
+        d2_file, d1_file, hrrr_file, mrms_file, suptitle=suptitle, **kwargs
+    )
+
+
+# ---------------------------------------------------------------------------
 # Single-panel plots
 #
 # One field, one map, on the same Lambert projection / map extent / WRF-domain

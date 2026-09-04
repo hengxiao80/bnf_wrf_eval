@@ -72,8 +72,17 @@ SCHEMES = {
 }
 REF_SCHEME = "rund1"  # subdir used for the (time-independent) domain geometry
 
+# The 500-m ndown runs, for the "d2run"-scope 4-panel comparisons. Each d2
+# run's d1 (2.5-km parent) panel is resolved by
+# `plotting._D2_TO_D1_RUN` (rund2 -> rund1, rund2-dynlit -> rund1-dynlit).
+D2_SCHEMES = {
+    "rund2": "500-m (D2) Thompson",
+    "rund2-dynlit": "500-m (D2) Thompson + dyn-lightning",
+}
+
 # type -> (scope, cadence-minutes, output-filename prefix). scope "run"
-# iterates every case x scheme; scope "case" iterates case days only.
+# iterates every case x d1 scheme; "case" iterates case days only; "d2run"
+# iterates every case x d2 scheme (D2_SCHEMES).
 TYPES: dict[str, tuple[str, int, str]] = {
     "tb4": ("run", 60, "wrf_ctt_crtm_hrrr_goes_tb_comparison"),
     "tb4_simple": ("run", 60, "wrf_simple_tb_crtm_hrrr_goes_tb_comparison"),
@@ -85,10 +94,15 @@ TYPES: dict[str, tuple[str, int, str]] = {
     "hrrr_refl": ("case", 60, "hrrr_refl"),
     "goes_tb": ("case", 5, "goes_tb"),
     "mrms_refl": ("case", 15, "mrms_refl"),
+    # d2 (500-m) 4-panel comparisons: d2 | d1 | HRRR | obs, hourly, all
+    # Tb panels OLR-derived (no CRTM -- unlike the d1 `tb4`/`wrf_tb`).
+    "d2_tb4": ("d2run", 60, "d2_olr_tb_4panel"),
+    "d2_refl4": ("d2run", 60, "d2_refl_4panel"),
 }
 GROUPS = {
     "comparison": ["tb4", "tb4_simple", "refl3"],
     "single": ["wrf_tb", "wrf_refl", "wrf_olr_tb", "hrrr_tb", "hrrr_refl", "goes_tb", "mrms_refl"],
+    "d2": ["d2_tb4", "d2_refl4"],
     "all": list(TYPES),
 }
 
@@ -158,9 +172,10 @@ def build_worklist(
         scope, cadence, prefix = TYPES[ptype]
         out_dir = frames_root / ptype
 
-        if scope == "run":
+        if scope in ("run", "d2run"):
+            schemes = SCHEMES if scope == "run" else D2_SCHEMES
             for case in CASES:
-                for scheme in SCHEMES:
+                for scheme in schemes:
                     run_dir = runs_root / case / scheme
                     for when in _wrf_times(run_dir, domain, cadence):
                         if start and when < start:
@@ -236,6 +251,20 @@ def _render(item: tuple, opts: argparse.Namespace) -> None:
             plotting.plot_run_wrf_olr_tb_single(
                 when, SCHEMES[Path(key).name], key, domain=opts.domain,
                 out_file=out_path,
+            )
+        elif ptype == "d2_tb4":
+            plotting.plot_run_d2_tb_comparison_4panel(
+                when, D2_SCHEMES[Path(key).name], key,
+                hrrr_base_dir=opts.hrrr_dir, goes_dir=opts.goes_dir,
+                domain=opts.domain, out_file=out_path,
+                auto_download_goes=opts.auto_download,
+            )
+        elif ptype == "d2_refl4":
+            plotting.plot_run_d2_refl_comparison_4panel(
+                when, D2_SCHEMES[Path(key).name], key,
+                hrrr_base_dir=opts.hrrr_dir, mrms_dir=opts.mrms_dir,
+                domain=opts.domain, out_file=out_path,
+                auto_download_mrms=opts.auto_download,
             )
         elif ptype == "hrrr_tb":
             plotting.plot_case_hrrr_tb_single(
